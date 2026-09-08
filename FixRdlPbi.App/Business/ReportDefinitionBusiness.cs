@@ -28,11 +28,37 @@ public class ReportDefinitionBusiness
 
     public async Task<List<RdlVisualReference>> GetRdlVisualReferencesAsync(string workspaceId, string workspaceName, string reportId, string reportName)
     {
-        ReportDefinitionResponse definition = await GetReportDefinitionAsync(workspaceId, reportId);
+        ReportInspectionResult inspection = await GetInspectionAsync(
+            workspaceId,
+            workspaceName,
+            reportId,
+            reportName
+        );
+
+        return inspection.RdlVisualReferences;
+    }
+
+    public async Task<ReportInspectionResult> GetInspectionAsync(
+        string workspaceId,
+        string workspaceName,
+        string reportId,
+        string reportName)
+    {
+        ReportDefinitionResponse definition = await GetReportDefinitionAsync(
+            workspaceId,
+            reportId
+        );
 
         await SaveDecodedDefinitionAsync(definition, workspaceName, reportName);
 
-        return GetRdlVisualReferences(definition);
+        ReportInspectionResult result = new()
+        {
+            RdlVisualReferences = GetRdlVisualReferences(definition)
+        };
+
+        await PopulateSemanticModelAsync(result, definition, workspaceId);
+
+        return result;
     }
 
     private static async Task SaveDecodedDefinitionAsync(ReportDefinitionResponse definition, string workspaceName, string reportName)
@@ -243,6 +269,224 @@ public class ReportDefinitionBusiness
         }
 
         return 2;
+    }
+
+    private async Task PopulateSemanticModelAsync(
+        ReportInspectionResult result,
+        ReportDefinitionResponse definition,
+        string workspaceId)
+    {
+        ReportDefinitionPart definitionPart = definition.Definition.Parts
+            .FirstOrDefault(
+                x => string.Equals(
+                    x.Path,
+                    "definition.pbir",
+                    StringComparison.OrdinalIgnoreCase
+                )
+            );
+
+        if (definitionPart == null)
+        {
+            return;
+        }
+
+        string definitionJson = DecodeBase64Utf8(definitionPart.Payload);
+
+        using JsonDocument document = JsonDocument.Parse(definitionJson);
+
+        if (!document.RootElement.TryGetProperty(
+            "datasetReference",
+            out JsonElement datasetReference))
+        {
+            return;
+        }
+
+        if (datasetReference.TryGetProperty(
+            "byConnection",
+            out JsonElement byConnection))
+        {
+            result.SemanticModelReferenceType = "byConnection";
+
+            if (byConnection.TryGetProperty(
+                "connectionString",
+                out JsonElement connectionStringElement))
+            {
+                string connectionString = connectionStringElement.GetString();
+
+                result.SemanticModelReference = connectionString ?? string.Empty;
+
+                string semanticModelId = GetSemanticModelIdFromConnectionString(
+                    result.SemanticModelReference
+                );
+
+                if (!string.IsNullOrWhiteSpace(semanticModelId))
+                {
+                    result.SemanticModel = await TryGetSemanticModelAsync(
+                        workspaceId,
+                        semanticModelId
+                    );
+                }
+            }
+
+            return;
+        }
+
+        if (datasetReference.TryGetProperty(
+            "byPath",
+            out JsonElement byPath))
+        {
+            result.SemanticModelReferenceType = "byPath";
+
+            if (!byPath.TryGetProperty("path", out JsonElement pathElement))
+            {
+                return;
+            }
+
+            string path = pathElement.GetString();
+
+            result.SemanticModelReference = path ?? string.Empty;
+
+            string semanticModelName = GetSemanticModelNameFromPath(
+                result.SemanticModelReference
+            );
+
+            if (!string.IsNullOrWhiteSpace(semanticModelName))
+            {
+                result.SemanticModel = await TryFindSemanticModelByNameAsync(
+                    workspaceId,
+                    semanticModelName
+                );
+
+                if (result.SemanticModel == null)
+                {
+                    result.SemanticModel = new SemanticModel
+                    {
+                        DisplayName = semanticModelName,
+                        Type = "SemanticModel",
+                        WorkspaceId = workspaceId
+                    };
+                }
+            }
+        }
+    }
+
+    private async Task<SemanticModel> TryGetSemanticModelAsync(
+        string workspaceId,
+        string semanticModelId)
+    {
+        try
+        {
+            return await _fabricApiClient.GetAsync<SemanticModel>(
+                $"workspaces/{workspaceId}/semanticModels/{semanticModelId}"
+            );
+        }
+        catch (HttpRequestException)
+        {
+            return new SemanticModel
+            {
+                Id = semanticModelId,
+                Type = "SemanticModel",
+                WorkspaceId = workspaceId
+            };
+        }
+    }
+
+    private async Task<SemanticModel> TryFindSemanticModelByNameAsync(
+        string workspaceId,
+        string semanticModelName)
+    {
+        string endpoint = $"workspaces/{workspaceId}/semanticModels";
+
+        while (!string.IsNullOrWhiteSpace(endpoint))
+        {
+            FabricSemanticModelResponse response;
+
+            try
+            {
+                response = await _fabricApiClient.GetAsync<FabricSemanticModelResponse>(
+                    endpoint
+                );
+            }
+            catch (HttpRequestException)
+            {
+                return null;
+            }
+
+            if (response == null)
+            {
+                return null;
+            }
+
+            SemanticModel semanticModel = response.Value.FirstOrDefault(
+                x => string.Equals(
+                    x.DisplayName,
+                    semanticModelName,
+                    StringComparison.OrdinalIgnoreCase
+                )
+            );
+
+            if (semanticModel != null)
+            {
+                return semanticModel;
+            }
+
+            endpoint = response.ContinuationUri;
+        }
+
+        return null;
+    }
+
+    private static string GetSemanticModelIdFromConnectionString(
+        string connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            return string.Empty;
+        }
+
+        const string key = "semanticmodelid=";
+
+        int keyIndex = connectionString.IndexOf(
+            key,
+            StringComparison.OrdinalIgnoreCase
+        );
+
+        if (keyIndex < 0)
+        {
+            return string.Empty;
+        }
+
+        int valueStart = keyIndex + key.Length;
+        int valueEnd = connectionString.IndexOf(';', valueStart);
+
+        string value = valueEnd < 0
+            ? connectionString[valueStart..]
+            : connectionString[valueStart..valueEnd];
+
+        return value.Trim().Trim('[', ']');
+    }
+
+    private static string GetSemanticModelNameFromPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        string normalizedPath = path.Replace('\\', '/').TrimEnd('/');
+        string name = normalizedPath.Split('/').Last();
+
+        if (name.EndsWith(".SemanticModel", StringComparison.OrdinalIgnoreCase))
+        {
+            return name[..^".SemanticModel".Length];
+        }
+
+        if (name.EndsWith(".Dataset", StringComparison.OrdinalIgnoreCase))
+        {
+            return name[..^".Dataset".Length];
+        }
+
+        return name;
     }
 
     private static List<RdlVisualReference> GetRdlVisualReferences(ReportDefinitionResponse definition)
