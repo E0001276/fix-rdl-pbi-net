@@ -15,7 +15,8 @@ public class FabricApiClient
     private readonly JsonSerializerOptions _jsonOptions =
         new()
         {
-            PropertyNameCaseInsensitive = true
+            PropertyNameCaseInsensitive = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         };
 
     public FabricApiClient(HttpClient httpClient, FabricTokenProvider tokenProvider)
@@ -88,5 +89,15 @@ public class FabricApiClient
         await PrepareRequestAsync();
 
         return await _httpClient.GetAsync(endpoint);
+    }
+
+    public async Task<HttpResponseMessage> PostResponseAsync<TRequest>(string endpoint, TRequest request)
+    {
+        await PrepareRequestAsync();
+
+        string json = JsonSerializer.Serialize(request, _jsonOptions);
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        return await _httpClient.PostAsync(endpoint, content);
     }
 }

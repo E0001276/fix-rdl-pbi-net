@@ -1,0 +1,1168 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
+using FixRdlPbi.App.Clients;
+using FixRdlPbi.App.Models;
+
+namespace FixRdlPbi.App.Business;
+
+public class FixRdlVisualBusiness
+{
+    private readonly FabricApiClient _fabricApiClient;
+    private readonly ReportBusiness _reportBusiness;
+    private readonly PaginatedReportBusiness _paginatedReportBusiness;
+    private readonly SemanticModelBusiness _semanticModelBusiness;
+    private readonly ReportDefinitionBusiness _reportDefinitionBusiness;
+    private readonly PaginatedReportDefinitionBusiness _paginatedReportDefinitionBusiness;
+    private readonly PowerBiApiClient _powerBiApiClient;
+
+    public FixRdlVisualBusiness(
+        FabricApiClient fabricApiClient,
+        PowerBiApiClient powerBiApiClient)
+    {
+        _fabricApiClient = fabricApiClient;
+        _powerBiApiClient = powerBiApiClient;
+        _reportBusiness = new ReportBusiness(fabricApiClient);
+        _paginatedReportBusiness = new PaginatedReportBusiness(fabricApiClient);
+        _semanticModelBusiness = new SemanticModelBusiness(fabricApiClient);
+        _reportDefinitionBusiness = new ReportDefinitionBusiness(fabricApiClient);
+        _paginatedReportDefinitionBusiness = new PaginatedReportDefinitionBusiness(fabricApiClient);
+    }
+
+    public async Task<FixRdlAnalysis> AnalyzeAsync(
+        Workspace sourceWorkspace,
+        Workspace targetWorkspace,
+        Report sourceReport)
+    {
+        FixRdlAnalysis analysis = new()
+        {
+            SourceWorkspace = sourceWorkspace,
+            TargetWorkspace = targetWorkspace,
+            SourceReport = sourceReport
+        };
+
+        List<Report> targetReports = await _reportBusiness.GetReportsAsync(targetWorkspace.Id);
+        analysis.TargetReport = FindUniqueByName(
+            targetReports,
+            sourceReport.DisplayName,
+            "Power BI report",
+            targetWorkspace.DisplayName
+        );
+
+        Task<List<PaginatedReport>> sourcePaginatedTask =
+            _paginatedReportBusiness.GetPaginatedReportsAsync(sourceWorkspace.Id);
+        Task<List<PaginatedReport>> targetPaginatedTask =
+            _paginatedReportBusiness.GetPaginatedReportsAsync(targetWorkspace.Id);
+        Task<List<SemanticModel>> targetModelsTask =
+            _semanticModelBusiness.GetSemanticModelsAsync(targetWorkspace.Id);
+        Task<ReportInspectionResult> sourceInspectionTask =
+            _reportDefinitionBusiness.GetInspectionAsync(
+                sourceWorkspace.Id,
+                sourceWorkspace.DisplayName,
+                sourceReport.Id,
+                sourceReport.DisplayName
+            );
+        Task<ReportInspectionResult> targetInspectionTask =
+            _reportDefinitionBusiness.GetInspectionAsync(
+                targetWorkspace.Id,
+                targetWorkspace.DisplayName,
+                analysis.TargetReport.Id,
+                analysis.TargetReport.DisplayName
+            );
+
+        await Task.WhenAll(
+            sourcePaginatedTask,
+            targetPaginatedTask,
+            targetModelsTask,
+            sourceInspectionTask,
+            targetInspectionTask
+        );
+
+        List<PaginatedReport> sourcePaginated = await sourcePaginatedTask;
+        List<PaginatedReport> targetPaginated = await targetPaginatedTask;
+        List<SemanticModel> targetModels = await targetModelsTask;
+        analysis.SourceInspection = await sourceInspectionTask;
+        analysis.TargetInspection = await targetInspectionTask;
+        analysis.SourceSemanticModel = analysis.SourceInspection.SemanticModel;
+
+        if (analysis.SourceSemanticModel == null ||
+            string.IsNullOrWhiteSpace(analysis.SourceSemanticModel.Id))
+        {
+            throw new InvalidOperationException(
+                $"Could not resolve the source semantic model for report '{sourceReport.DisplayName}'."
+            );
+        }
+
+        string semanticModelName = !string.IsNullOrWhiteSpace(analysis.SourceSemanticModel.DisplayName)
+            ? analysis.SourceSemanticModel.DisplayName
+            : sourceReport.DisplayName;
+
+        analysis.TargetSemanticModel = FindUniqueByName(
+            targetModels,
+            semanticModelName,
+            "semantic model",
+            targetWorkspace.DisplayName
+        );
+
+        analysis.SourcePaginatedById = sourcePaginated
+            .ToDictionary(x => x.Id, StringComparer.OrdinalIgnoreCase);
+
+        analysis.TargetPaginatedByName = targetPaginated
+            .GroupBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                x => x.Key,
+                x => x.Count() == 1
+                    ? x.Single()
+                    : throw new InvalidOperationException(
+                        $"More than one paginated report named '{x.Key}' exists in '{targetWorkspace.DisplayName}'."
+                    ),
+                StringComparer.OrdinalIgnoreCase
+            );
+
+        BuildPaginatedMappings(analysis);
+        await BuildRowsAsync(analysis);
+
+        return analysis;
+    }
+
+    public async Task<string> ApplyAsync(FixRdlAnalysis analysis)
+    {
+        if (analysis == null)
+        {
+            throw new ArgumentNullException(nameof(analysis));
+        }
+
+        string backupDirectory = CreateBackupDirectory(analysis);
+
+        ReportDefinitionResponse targetReportDefinition = await GetReportDefinitionAsync(
+            analysis.TargetWorkspace.Id,
+            analysis.TargetReport.Id
+        );
+
+        await SaveBackupAsync(
+            backupDirectory,
+            $"Report-{SanitizeFileName(analysis.TargetReport.DisplayName)}.json",
+            targetReportDefinition
+        );
+
+        bool reportChanged = UpdatePowerBiReportDefinition(
+            targetReportDefinition,
+            analysis
+        );
+
+        if (reportChanged)
+        {
+            await UpdateDefinitionAsync(
+                $"workspaces/{analysis.TargetWorkspace.Id}/reports/{analysis.TargetReport.Id}/updateDefinition",
+                new UpdateDefinitionRequest
+                {
+                    Definition = targetReportDefinition.Definition
+                }
+            );
+        }
+
+        int paginatedChanged = 0;
+
+        foreach (PaginatedReport paginatedReport in analysis.TargetPaginatedReports)
+        {
+            string targetServer = BuildPowerBiServer(analysis.TargetWorkspace.DisplayName);
+            string targetDatabase = analysis.TargetSemanticModel.DisplayName;
+
+            PowerBiDatasourceResponse runtimeDatasources =
+                await GetPaginatedRuntimeDatasourcesAsync(
+                    analysis.TargetWorkspace.Id,
+                    paginatedReport.Id
+                );
+
+            bool runtimeAlreadyCorrect = runtimeDatasources.Value.Count > 0 &&
+                runtimeDatasources.Value.All(x =>
+                    IsTargetDatasource(x, targetServer, targetDatabase));
+
+            if (runtimeAlreadyCorrect)
+            {
+                continue;
+            }
+
+            PaginatedReportInspectionResult inspection =
+                await _paginatedReportDefinitionBusiness.GetInspectionAsync(
+                    analysis.TargetWorkspace.Id,
+                    paginatedReport.Id
+                );
+
+            List<UpdateRdlDatasourceDetail> updateDetails = new();
+
+            foreach (PaginatedDataSource dataSource in inspection.DataSources)
+            {
+                if (string.IsNullOrWhiteSpace(dataSource.Name))
+                {
+                    throw new InvalidOperationException(
+                        $"Paginated report '{paginatedReport.DisplayName}' contains a data source without a name."
+                    );
+                }
+
+                updateDetails.Add(new UpdateRdlDatasourceDetail
+                {
+                    DatasourceName = dataSource.Name,
+                    ConnectionDetails = new RdlDatasourceConnectionDetails
+                    {
+                        Server = targetServer,
+                        Database = targetDatabase
+                    }
+                });
+            }
+
+            if (updateDetails.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Paginated report '{paginatedReport.DisplayName}' has no RDL data sources to update."
+                );
+            }
+
+            // UpdateDatasources for RDL reports requires the caller to own the
+            // paginated report data sources. TakeOver is idempotent for this use case
+            // and avoids a later ownership error after a deployment.
+            await _powerBiApiClient.PostAsync(
+                $"groups/{analysis.TargetWorkspace.Id}/reports/{paginatedReport.Id}/Default.TakeOver"
+            );
+
+            UpdateRdlDatasourcesRequest request = new()
+            {
+                UpdateDetails = updateDetails
+            };
+
+            await _powerBiApiClient.PostAsync(
+                $"groups/{analysis.TargetWorkspace.Id}/reports/{paginatedReport.Id}/Default.UpdateDatasources",
+                request
+            );
+
+            paginatedChanged++;
+        }
+
+        return $"Completed. Power BI report updated: {(reportChanged ? "Yes" : "No")}. " +
+               $"Paginated reports updated: {paginatedChanged}. Backup: {backupDirectory}";
+    }
+
+    private void BuildPaginatedMappings(FixRdlAnalysis analysis)
+    {
+        HashSet<string> targetIds = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (RdlVisualReference sourceReference in analysis.SourceInspection.RdlVisualReferences)
+        {
+            if (!analysis.SourcePaginatedById.TryGetValue(
+                sourceReference.ReportId,
+                out PaginatedReport sourcePaginated))
+            {
+                throw new InvalidOperationException(
+                    $"Source RDL visual on page '{sourceReference.PageName}' references paginated report " +
+                    $"'{sourceReference.ReportId}', but that item was not found in source workspace '{analysis.SourceWorkspace.DisplayName}'."
+                );
+            }
+
+            if (!analysis.TargetPaginatedByName.TryGetValue(
+                sourcePaginated.DisplayName,
+                out PaginatedReport targetPaginated))
+            {
+                throw new InvalidOperationException(
+                    $"Target paginated report '{sourcePaginated.DisplayName}' was not found in workspace '{analysis.TargetWorkspace.DisplayName}'."
+                );
+            }
+
+            analysis.SourcePaginatedIdToTargetId[sourcePaginated.Id] = targetPaginated.Id;
+            targetIds.Add(targetPaginated.Id);
+        }
+
+        analysis.TargetPaginatedReports = analysis.TargetPaginatedByName.Values
+            .Where(x => targetIds.Contains(x.Id))
+            .OrderBy(x => x.DisplayName)
+            .ToList();
+
+        foreach (RdlVisualReference targetReference in analysis.TargetInspection.RdlVisualReferences)
+        {
+            string desiredTargetId = ResolveDesiredPaginatedId(analysis, targetReference);
+
+            if (!string.IsNullOrWhiteSpace(desiredTargetId))
+            {
+                analysis.TargetCurrentPaginatedIdToTargetId[targetReference.ReportId] = desiredTargetId;
+            }
+        }
+    }
+
+    private async Task BuildRowsAsync(FixRdlAnalysis analysis)
+    {
+        analysis.Rows.Clear();
+
+        string currentSemanticModelId = analysis.TargetInspection.SemanticModel == null
+            ? ExtractSemanticModelId(analysis.TargetInspection.SemanticModelReference)
+            : analysis.TargetInspection.SemanticModel.Id;
+
+        analysis.Rows.Add(new FixRdlPlanRow
+        {
+            ArtifactType = "Power BI Report",
+            ArtifactName = analysis.TargetReport.DisplayName,
+            Property = "Semantic model",
+            CurrentValue = currentSemanticModelId,
+            TargetValue = analysis.TargetSemanticModel.Id,
+            Status = EqualsIgnoreCase(currentSemanticModelId, analysis.TargetSemanticModel.Id)
+                ? "Correct"
+                : "Needs fix"
+        });
+
+        foreach (RdlVisualReference targetReference in analysis.TargetInspection.RdlVisualReferences)
+        {
+            string desiredTargetId = ResolveDesiredPaginatedId(analysis, targetReference);
+
+            if (string.IsNullOrWhiteSpace(desiredTargetId))
+            {
+                analysis.Rows.Add(new FixRdlPlanRow
+                {
+                    ArtifactType = "RDL Visual",
+                    ArtifactName = targetReference.PageName,
+                    Property = "Paginated report",
+                    CurrentValue = targetReference.ReportId,
+                    TargetValue = "Unable to resolve",
+                    Status = "Error"
+                });
+                continue;
+            }
+
+            PaginatedReport desiredReport = analysis.TargetPaginatedReports
+                .First(x => EqualsIgnoreCase(x.Id, desiredTargetId));
+
+            analysis.Rows.Add(new FixRdlPlanRow
+            {
+                ArtifactType = "RDL Visual",
+                ArtifactName = targetReference.PageName,
+                Property = desiredReport.DisplayName,
+                CurrentValue = targetReference.ReportId,
+                TargetValue = desiredTargetId,
+                Status = EqualsIgnoreCase(targetReference.ReportId, desiredTargetId)
+                    && EqualsIgnoreCase(targetReference.WorkspaceId, analysis.TargetWorkspace.Id)
+                    ? "Correct"
+                    : "Needs fix"
+            });
+        }
+
+        foreach (PaginatedReport paginatedReport in analysis.TargetPaginatedReports)
+        {
+            string targetServer = BuildPowerBiServer(analysis.TargetWorkspace.DisplayName);
+            string targetDatabase = analysis.TargetSemanticModel.DisplayName;
+
+            PowerBiDatasourceResponse runtimeDatasources =
+                await GetPaginatedRuntimeDatasourcesAsync(
+                    analysis.TargetWorkspace.Id,
+                    paginatedReport.Id
+                );
+
+            if (runtimeDatasources.Value.Count == 0)
+            {
+                analysis.Rows.Add(new FixRdlPlanRow
+                {
+                    ArtifactType = "Paginated Report",
+                    ArtifactName = paginatedReport.DisplayName,
+                    Property = "Runtime data source",
+                    CurrentValue = "No data source returned by Power BI API",
+                    TargetValue = FormatDatasource(targetServer, targetDatabase),
+                    Status = "Error"
+                });
+                continue;
+            }
+
+            foreach (PowerBiDatasource dataSource in runtimeDatasources.Value)
+            {
+                string currentServer = dataSource.ConnectionDetails?.Server ?? string.Empty;
+                string currentDatabase = dataSource.ConnectionDetails?.Database ?? string.Empty;
+
+                analysis.Rows.Add(new FixRdlPlanRow
+                {
+                    ArtifactType = "Paginated Report",
+                    ArtifactName = paginatedReport.DisplayName,
+                    Property = "Runtime data source",
+                    CurrentValue = FormatDatasource(currentServer, currentDatabase),
+                    TargetValue = FormatDatasource(targetServer, targetDatabase),
+                    Status = IsTargetDatasource(dataSource, targetServer, targetDatabase)
+                        ? "Correct"
+                        : "Needs fix"
+                });
+            }
+        }
+    }
+
+    private static string ResolveDesiredPaginatedId(
+        FixRdlAnalysis analysis,
+        RdlVisualReference targetReference)
+    {
+        if (analysis.SourcePaginatedIdToTargetId.TryGetValue(
+            targetReference.ReportId,
+            out string mappedId))
+        {
+            return mappedId;
+        }
+
+        PaginatedReport alreadyTarget = analysis.TargetPaginatedReports.FirstOrDefault(
+            x => EqualsIgnoreCase(x.Id, targetReference.ReportId)
+        );
+
+        if (alreadyTarget != null)
+        {
+            return alreadyTarget.Id;
+        }
+
+        RdlVisualReference sourceSamePage = analysis.SourceInspection.RdlVisualReferences
+            .FirstOrDefault(
+                x => string.Equals(
+                    x.PageName,
+                    targetReference.PageName,
+                    StringComparison.OrdinalIgnoreCase
+                )
+            );
+
+        if (sourceSamePage != null &&
+            analysis.SourcePaginatedIdToTargetId.TryGetValue(
+                sourceSamePage.ReportId,
+                out mappedId))
+        {
+            return mappedId;
+        }
+
+        return string.Empty;
+    }
+
+    private static bool UpdatePowerBiReportDefinition(
+        ReportDefinitionResponse definition,
+        FixRdlAnalysis analysis)
+    {
+        bool changed = false;
+
+        foreach (ReportDefinitionPart part in definition.Definition.Parts)
+        {
+            if (string.Equals(part.Path, "definition.pbir", StringComparison.OrdinalIgnoreCase))
+            {
+                string currentSemanticModelId = analysis.TargetInspection.SemanticModel == null
+                    ? ExtractSemanticModelId(analysis.TargetInspection.SemanticModelReference)
+                    : analysis.TargetInspection.SemanticModel.Id;
+
+                if (!EqualsIgnoreCase(currentSemanticModelId, analysis.TargetSemanticModel.Id))
+                {
+                    JsonNode root = JsonNode.Parse(DecodeBase64Utf8(part.Payload));
+
+                    if (root is JsonObject rootObject)
+                    {
+                        JsonObject byConnection = new()
+                        {
+                            ["connectionString"] = $"semanticmodelid={analysis.TargetSemanticModel.Id}"
+                        };
+
+                        JsonObject datasetReference = new()
+                        {
+                            ["byConnection"] = byConnection
+                        };
+
+                        rootObject["datasetReference"] = datasetReference;
+                        part.Payload = EncodeBase64Utf8(rootObject.ToJsonString(JsonIndentedOptions()));
+                        changed = true;
+                    }
+                }
+
+                continue;
+            }
+
+            if (!part.Path.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            JsonNode json;
+
+            try
+            {
+                json = JsonNode.Parse(DecodeBase64Utf8(part.Payload));
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+
+            if (json == null)
+            {
+                continue;
+            }
+
+            bool partChanged = UpdateRdlVisualNodes(json, analysis);
+
+            if (partChanged)
+            {
+                part.Payload = EncodeBase64Utf8(json.ToJsonString(JsonIndentedOptions()));
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool UpdateRdlVisualNodes(JsonNode node, FixRdlAnalysis analysis)
+    {
+        bool changed = false;
+
+        if (node is JsonObject obj)
+        {
+            if (obj["visual"] is JsonObject visualObject &&
+                TryGetStringValue(visualObject["visualType"], out string visualType) &&
+                string.Equals(visualType, "rdlVisual", StringComparison.OrdinalIgnoreCase))
+            {
+                JsonObject referenceObject = GetRdlByReferenceObject(visualObject);
+
+                if (referenceObject != null)
+                {
+                    string currentItemId = GetLiteralValue(referenceObject, "itemId");
+                    string currentWorkspaceId = GetLiteralValue(referenceObject, "workspaceId");
+                    string desiredItemId = string.Empty;
+
+                    if (analysis.SourcePaginatedIdToTargetId.TryGetValue(currentItemId, out string mapped))
+                    {
+                        desiredItemId = mapped;
+                    }
+                    else if (analysis.TargetCurrentPaginatedIdToTargetId.TryGetValue(currentItemId, out mapped))
+                    {
+                        desiredItemId = mapped;
+                    }
+                    else if (analysis.TargetPaginatedReports.Any(x => EqualsIgnoreCase(x.Id, currentItemId)))
+                    {
+                        desiredItemId = currentItemId;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(desiredItemId) &&
+                        !EqualsIgnoreCase(currentItemId, desiredItemId) &&
+                        SetLiteralValue(referenceObject, "itemId", desiredItemId))
+                    {
+                        changed = true;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(currentWorkspaceId) &&
+                        !EqualsIgnoreCase(currentWorkspaceId, analysis.TargetWorkspace.Id) &&
+                        SetLiteralValue(referenceObject, "workspaceId", analysis.TargetWorkspace.Id))
+                    {
+                        changed = true;
+                    }
+                }
+            }
+
+            foreach (KeyValuePair<string, JsonNode> property in obj.ToList())
+            {
+                if (property.Value != null)
+                {
+                    changed |= UpdateRdlVisualNodes(property.Value, analysis);
+                }
+            }
+        }
+        else if (node is JsonArray array)
+        {
+            foreach (JsonNode child in array)
+            {
+                if (child != null)
+                {
+                    changed |= UpdateRdlVisualNodes(child, analysis);
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    private static JsonObject GetRdlByReferenceObject(JsonObject visualObject)
+    {
+        if (visualObject["objects"] is not JsonObject objectsObject ||
+            objectsObject["reportInfo"] is not JsonArray reportInfoArray ||
+            reportInfoArray.Count == 0 ||
+            reportInfoArray[0] is not JsonObject reportInfoObject ||
+            reportInfoObject["properties"] is not JsonObject propertiesObject ||
+            propertiesObject["reference"] is not JsonObject referenceObject ||
+            referenceObject["byReference"] is not JsonObject byReferenceObject)
+        {
+            return null;
+        }
+
+        return byReferenceObject;
+    }
+
+    private static string GetLiteralValue(JsonObject referenceObject, string propertyName)
+    {
+        if (referenceObject[propertyName] is not JsonObject propertyObject ||
+            propertyObject["expr"] is not JsonObject exprObject ||
+            exprObject["Literal"] is not JsonObject literalObject ||
+            !TryGetStringValue(literalObject["Value"], out string value))
+        {
+            return string.Empty;
+        }
+
+        return TrimLiteral(value);
+    }
+
+    private static bool SetLiteralValue(JsonObject referenceObject, string propertyName, string value)
+    {
+        if (referenceObject[propertyName] is not JsonObject propertyObject ||
+            propertyObject["expr"] is not JsonObject exprObject ||
+            exprObject["Literal"] is not JsonObject literalObject)
+        {
+            return false;
+        }
+
+        literalObject["Value"] = $"'{value}'";
+        return true;
+    }
+
+    private static bool TryGetStringValue(JsonNode node, out string value)
+    {
+        value = string.Empty;
+
+        if (node is not JsonValue jsonValue ||
+            !jsonValue.TryGetValue(out string stringValue) ||
+            string.IsNullOrWhiteSpace(stringValue))
+        {
+            return false;
+        }
+
+        value = stringValue;
+        return true;
+    }
+
+    private static bool UpdatePaginatedReportDefinition(
+        ReportDefinitionResponse definition,
+        FixRdlAnalysis analysis)
+    {
+        bool changed = false;
+
+        foreach (ReportDefinitionPart part in definition.Definition.Parts)
+        {
+            if (!part.Path.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            XDocument document = LoadXmlDocumentFromBase64(part);
+            bool partChanged = false;
+
+            foreach (XElement element in document.Descendants())
+            {
+                if (string.Equals(element.Name.LocalName, "ConnectString", StringComparison.OrdinalIgnoreCase))
+                {
+                    string updated = UpdateConnectionString(
+                        element.Value,
+                        analysis.SourceWorkspace,
+                        analysis.TargetWorkspace,
+                        analysis.SourceSemanticModel,
+                        analysis.TargetSemanticModel
+                    );
+
+                    if (!string.Equals(element.Value, updated, StringComparison.Ordinal))
+                    {
+                        element.Value = updated;
+                        partChanged = true;
+                    }
+                }
+                else if (string.Equals(element.Name.LocalName, "PowerBIWorkspaceName", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.Equals(
+                        element.Value,
+                        analysis.TargetWorkspace.DisplayName,
+                        StringComparison.Ordinal))
+                    {
+                        element.Value = analysis.TargetWorkspace.DisplayName;
+                        partChanged = true;
+                    }
+                }
+                else if (string.Equals(element.Name.LocalName, "PowerBIDatasetName", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.Equals(
+                        element.Value,
+                        analysis.TargetSemanticModel.DisplayName,
+                        StringComparison.Ordinal))
+                    {
+                        element.Value = analysis.TargetSemanticModel.DisplayName;
+                        partChanged = true;
+                    }
+                }
+            }
+
+            if (partChanged)
+            {
+                part.Payload = EncodeXmlDocumentBase64(document);
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static string UpdateConnectionString(
+        string connectionString,
+        Workspace sourceWorkspace,
+        Workspace targetWorkspace,
+        SemanticModel sourceModel,
+        SemanticModel targetModel)
+    {
+        string result = connectionString;
+
+        if (!string.IsNullOrWhiteSpace(sourceModel.Id))
+        {
+            result = ReplaceIgnoreCase(result, sourceModel.Id, targetModel.Id);
+        }
+
+        if (!string.IsNullOrWhiteSpace(sourceWorkspace.Id))
+        {
+            result = ReplaceIgnoreCase(result, sourceWorkspace.Id, targetWorkspace.Id);
+        }
+
+        if (!string.IsNullOrWhiteSpace(sourceWorkspace.DisplayName))
+        {
+            result = ReplaceIgnoreCase(
+                result,
+                sourceWorkspace.DisplayName,
+                targetWorkspace.DisplayName
+            );
+        }
+
+        result = Regex.Replace(
+            result,
+            @"(?i)(Initial\s+Catalog\s*=\s*sobe_wowvirtualserver-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            match => match.Groups[1].Value + targetModel.Id
+        );
+
+        result = Regex.Replace(
+            result,
+            @"(?i)(semanticmodelid\s*=\s*)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            match => match.Groups[1].Value + targetModel.Id
+        );
+
+        return result;
+    }
+
+    private async Task<PowerBiDatasourceResponse> GetPaginatedRuntimeDatasourcesAsync(
+        string workspaceId,
+        string reportId)
+    {
+        return await _powerBiApiClient.GetAsync<PowerBiDatasourceResponse>(
+            $"groups/{workspaceId}/reports/{reportId}/datasources"
+        );
+    }
+
+    private static string BuildPowerBiServer(string workspaceName)
+    {
+        return $"powerbi://api.powerbi.com/v1.0/myorg/{workspaceName}";
+    }
+
+    private static bool IsTargetDatasource(
+        PowerBiDatasource dataSource,
+        string targetServer,
+        string targetDatabase)
+    {
+        if (dataSource == null || dataSource.ConnectionDetails == null)
+        {
+            return false;
+        }
+
+        return EqualsNormalizedConnectionValue(
+                dataSource.ConnectionDetails.Server,
+                targetServer) &&
+            EqualsNormalizedConnectionValue(
+                dataSource.ConnectionDetails.Database,
+                targetDatabase);
+    }
+
+    private static bool EqualsNormalizedConnectionValue(string left, string right)
+    {
+        return string.Equals(
+            (left ?? string.Empty).Trim().TrimEnd('/'),
+            (right ?? string.Empty).Trim().TrimEnd('/'),
+            StringComparison.OrdinalIgnoreCase
+        );
+    }
+
+    private static string FormatDatasource(string server, string database)
+    {
+        return $"Server={server}; Database={database}";
+    }
+
+    private async Task<ReportDefinitionResponse> GetReportDefinitionAsync(
+        string workspaceId,
+        string reportId)
+    {
+        return await GetDefinitionAsync(
+            $"workspaces/{workspaceId}/reports/{reportId}/getDefinition"
+        );
+    }
+
+    private async Task<ReportDefinitionResponse> GetPaginatedDefinitionAsync(
+        string workspaceId,
+        string reportId)
+    {
+        ReportDefinitionResponse response = await GetDefinitionAsync(
+            $"workspaces/{workspaceId}/paginatedReports/{reportId}/getDefinition"
+        );
+
+        if (string.IsNullOrWhiteSpace(response.Definition.Format))
+        {
+            response.Definition.Format = "PaginatedReportDefinition";
+        }
+
+        return response;
+    }
+
+    private async Task<ReportDefinitionResponse> GetDefinitionAsync(string endpoint)
+    {
+        using HttpResponseMessage response = await _fabricApiClient.PostAsync(endpoint);
+
+        if (response.StatusCode == System.Net.HttpStatusCode.OK)
+        {
+            string json = await response.Content.ReadAsStringAsync();
+            ReportDefinitionResponse result = JsonSerializer.Deserialize<ReportDefinitionResponse>(
+                json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+            );
+
+            return result ?? throw new InvalidOperationException("Fabric returned an empty definition.");
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
+        {
+            string operationId = GetOperationId(response);
+            await WaitForOperationAsync(operationId, GetRetryAfter(response));
+
+            ReportDefinitionResponse result =
+                await _fabricApiClient.GetAsync<ReportDefinitionResponse>(
+                    $"operations/{operationId}/result"
+                );
+
+            return result ?? throw new InvalidOperationException("Fabric returned an empty operation result.");
+        }
+
+        string error = await response.Content.ReadAsStringAsync();
+        throw new HttpRequestException(
+            $"Error getting item definition. HTTP {(int)response.StatusCode}: {error}"
+        );
+    }
+
+    private async Task UpdateDefinitionAsync<TRequest>(string endpoint, TRequest request)
+    {
+        using HttpResponseMessage response = await _fabricApiClient.PostResponseAsync(endpoint, request);
+
+        if (response.StatusCode == System.Net.HttpStatusCode.OK)
+        {
+            return;
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
+        {
+            string operationId = GetOperationId(response);
+            await WaitForOperationAsync(operationId, GetRetryAfter(response));
+            return;
+        }
+
+        string error = await response.Content.ReadAsStringAsync();
+        throw new HttpRequestException(
+            $"Error updating item definition. HTTP {(int)response.StatusCode}: {error}"
+        );
+    }
+
+    private async Task WaitForOperationAsync(string operationId, int retryAfter)
+    {
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, retryAfter)));
+
+            FabricOperation operation = await _fabricApiClient.GetAsync<FabricOperation>(
+                $"operations/{operationId}"
+            );
+
+            if (operation == null)
+            {
+                throw new InvalidOperationException("Fabric returned an empty operation response.");
+            }
+
+            if (string.Equals(operation.Status, "Succeeded", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (string.Equals(operation.Status, "Failed", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(operation.Status, "Cancelled", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Fabric operation finished with status: {operation.Status}. Error: {operation.Error}"
+                );
+            }
+
+            retryAfter = 2;
+        }
+    }
+
+    private static string GetOperationId(HttpResponseMessage response)
+    {
+        if (response.Headers.TryGetValues("x-ms-operation-id", out IEnumerable<string> values))
+        {
+            return values.First();
+        }
+
+        if (response.Headers.Location != null)
+        {
+            string id = response.Headers.Location.ToString().TrimEnd('/').Split('/').Last();
+
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                return id;
+            }
+        }
+
+        throw new InvalidOperationException("Fabric did not return x-ms-operation-id.");
+    }
+
+    private static int GetRetryAfter(HttpResponseMessage response)
+    {
+        if (response.Headers.TryGetValues("Retry-After", out IEnumerable<string> values) &&
+            int.TryParse(values.FirstOrDefault(), out int seconds))
+        {
+            return seconds;
+        }
+
+        return 2;
+    }
+
+    private static T FindUniqueByName<T>(
+        IEnumerable<T> items,
+        string displayName,
+        string artifactType,
+        string workspaceName) where T : class
+    {
+        List<T> matches = items.Where(x =>
+        {
+            string name = x switch
+            {
+                Report report => report.DisplayName,
+                PaginatedReport report => report.DisplayName,
+                SemanticModel model => model.DisplayName,
+                _ => string.Empty
+            };
+
+            return string.Equals(name, displayName, StringComparison.OrdinalIgnoreCase);
+        }).ToList();
+
+        if (matches.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"The {artifactType} '{displayName}' was not found in workspace '{workspaceName}'."
+            );
+        }
+
+        if (matches.Count > 1)
+        {
+            throw new InvalidOperationException(
+                $"More than one {artifactType} named '{displayName}' exists in workspace '{workspaceName}'."
+            );
+        }
+
+        return matches[0];
+    }
+
+    private static string ExtractSemanticModelId(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        Match semanticModelMatch = Regex.Match(
+            value,
+            @"(?i)semanticmodelid\s*=\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+        );
+
+        if (semanticModelMatch.Success)
+        {
+            return semanticModelMatch.Groups[1].Value;
+        }
+
+        Match virtualServerMatch = Regex.Match(
+            value,
+            @"(?i)sobe_wowvirtualserver-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+        );
+
+        return virtualServerMatch.Success
+            ? virtualServerMatch.Groups[1].Value
+            : string.Empty;
+    }
+
+    private static string TrimLiteral(string value)
+    {
+        return (value ?? string.Empty).Trim().Trim('\'', '"');
+    }
+
+    private static string ReplaceIgnoreCase(string input, string oldValue, string newValue)
+    {
+        if (string.IsNullOrEmpty(input) || string.IsNullOrEmpty(oldValue))
+        {
+            return input;
+        }
+
+        return Regex.Replace(
+            input,
+            Regex.Escape(oldValue),
+            _ => newValue,
+            RegexOptions.IgnoreCase
+        );
+    }
+
+    private static bool EqualsIgnoreCase(string left, string right)
+    {
+        return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+
+    private static XDocument LoadXmlDocumentFromBase64(ReportDefinitionPart part)
+    {
+        if (string.IsNullOrWhiteSpace(part.Payload))
+        {
+            throw new InvalidOperationException(
+                $"Fabric returned an empty payload for RDL part '{part.Path}'."
+            );
+        }
+
+        byte[] bytes;
+
+        try
+        {
+            bytes = Convert.FromBase64String(part.Payload);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException(
+                $"The RDL payload is not valid Base64. Part: '{part.Path}'. Payload type: '{part.PayloadType}'.",
+                ex
+            );
+        }
+
+        try
+        {
+            using MemoryStream stream = new(bytes, writable: false);
+
+            // Parse from the original byte stream instead of first converting it to a .NET string.
+            // This lets the XML parser consume UTF-8/UTF-16 BOMs and honor the encoding declared
+            // by the RDL document. Converting a UTF-8 BOM to U+FEFF and then calling
+            // XDocument.Parse can cause: "Data at the root level is invalid. Line 1, position 1."
+            return XDocument.Load(stream, LoadOptions.PreserveWhitespace);
+        }
+        catch (XmlException ex)
+        {
+            throw new InvalidOperationException(
+                $"The RDL part '{part.Path}' could not be parsed as XML. " +
+                $"Payload type: '{part.PayloadType}'. Decoded prefix: {GetDecodedPrefix(bytes)}",
+                ex
+            );
+        }
+    }
+
+    private static string GetDecodedPrefix(byte[] bytes)
+    {
+        if (bytes == null || bytes.Length == 0)
+        {
+            return "(empty)";
+        }
+
+        int length = Math.Min(bytes.Length, 120);
+        string text;
+
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            length -= length % 2;
+            text = Encoding.Unicode.GetString(bytes, 0, length);
+        }
+        else if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            length -= length % 2;
+            text = Encoding.BigEndianUnicode.GetString(bytes, 0, length);
+        }
+        else
+        {
+            text = Encoding.UTF8.GetString(bytes, 0, length);
+        }
+
+        return text
+            .Replace("\r", " ")
+            .Replace("\n", " ")
+            .Trim();
+    }
+
+    private static string EncodeXmlDocumentBase64(XDocument document)
+    {
+        using MemoryStream stream = new();
+        XmlWriterSettings settings = new()
+        {
+            Encoding = new UTF8Encoding(false),
+            Indent = false,
+            OmitXmlDeclaration = false
+        };
+
+        using (XmlWriter writer = XmlWriter.Create(stream, settings))
+        {
+            document.Save(writer);
+        }
+
+        return Convert.ToBase64String(stream.ToArray());
+    }
+
+    private static string DecodeBase64Utf8(string payload)
+    {
+        return Encoding.UTF8.GetString(Convert.FromBase64String(payload));
+    }
+
+    private static string EncodeBase64Utf8(string value)
+    {
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
+    private static JsonSerializerOptions JsonIndentedOptions()
+    {
+        return new JsonSerializerOptions { WriteIndented = true };
+    }
+
+    private static string CreateBackupDirectory(FixRdlAnalysis analysis)
+    {
+        string directory = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            "backup",
+            $"{DateTime.Now:yyyyMMdd-HHmmss}-{SanitizeFileName(analysis.TargetWorkspace.DisplayName)}-{SanitizeFileName(analysis.TargetReport.DisplayName)}"
+        );
+
+        Directory.CreateDirectory(directory);
+        return directory;
+    }
+
+    private static async Task SaveBackupAsync(
+        string directory,
+        string fileName,
+        ReportDefinitionResponse definition)
+    {
+        string json = JsonSerializer.Serialize(
+            definition,
+            new JsonSerializerOptions { WriteIndented = true }
+        );
+
+        await File.WriteAllTextAsync(
+            Path.Combine(directory, fileName),
+            json,
+            Encoding.UTF8
+        );
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        string result = value ?? string.Empty;
+
+        foreach (char invalidChar in Path.GetInvalidFileNameChars())
+        {
+            result = result.Replace(invalidChar, '-');
+        }
+
+        return result.Trim();
+    }
+}

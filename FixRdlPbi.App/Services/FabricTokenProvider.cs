@@ -5,10 +5,21 @@ namespace FixRdlPbi.App.Services;
 public class FabricTokenProvider
 {
     private const string FabricResource = "https://api.fabric.microsoft.com";
+    private const string PowerBiResource = "https://analysis.windows.net/powerbi/api";
 
     private const string AzureCliPath = @"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd";
 
-    public async Task<string> GetAccessTokenAsync()
+    public Task<string> GetAccessTokenAsync()
+    {
+        return GetAccessTokenForResourceAsync(FabricResource);
+    }
+
+    public Task<string> GetPowerBiAccessTokenAsync()
+    {
+        return GetAccessTokenForResourceAsync(PowerBiResource);
+    }
+
+    private async Task<string> GetAccessTokenForResourceAsync(string resource)
     {
         if (!File.Exists(AzureCliPath))
         {
@@ -19,7 +30,7 @@ public class FabricTokenProvider
         {
             FileName = AzureCliPath,
             Arguments = $"account get-access-token "
-                + $"--resource {FabricResource} "
+                + $"--resource {resource} "
                 + $"--query accessToken "
                 + $"-o tsv",
             RedirectStandardOutput = true,
@@ -43,7 +54,7 @@ public class FabricTokenProvider
 
         if (process.ExitCode != 0)
         {
-            throw new InvalidOperationException("No fue posible obtener el token de Fabric." + Environment.NewLine + error);
+            throw new InvalidOperationException($"No fue posible obtener el token para {resource}." + Environment.NewLine + error);
         }
 
         string token = output.Trim();

@@ -33,5 +33,12 @@ public partial class MainForm : Form
 
     private void fixRdlVisualToolStripMenuItem_Click(object sender, EventArgs e)
     {
+        FixRdlVisualForm form = new FixRdlVisualForm();
+        form.MdiParent = this;
+        form.Show();
+        BeginInvoke(() =>
+        {
+            form.WindowState = FormWindowState.Maximized;
+        });
     }
 }
