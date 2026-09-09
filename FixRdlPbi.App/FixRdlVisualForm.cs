@@ -191,7 +191,8 @@ public partial class FixRdlVisualForm : Form
             "- Rebind the Power BI report to the target semantic model.\r\n" +
             "- Bind the target semantic model Oracle source to the matching on-premises gateway datasource.\r\n" +
             "- Replace RDL Visual references with target paginated report IDs.\r\n" +
-            "- Rebind the target paginated reports to the target semantic model.\r\n\r\n" +
+            "- Rewrite the paginated RDL definition (workspace metadata and semantic-model ID) for the target workspace.\r\n" +
+            "- Rebind the target paginated reports runtime datasource to the target semantic model.\r\n\r\n" +
             "A local backup of the current target definitions will be created first.\r\n\r\nContinue?",
             "Confirm remediation",
             MessageBoxButtons.YesNo,

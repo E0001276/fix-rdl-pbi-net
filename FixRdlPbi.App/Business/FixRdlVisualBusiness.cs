@@ -209,11 +209,52 @@ public class FixRdlVisualBusiness
         }
 
         int paginatedChanged = 0;
+        int paginatedDefinitionChanged = 0;
+        int paginatedRuntimeChanged = 0;
 
         foreach (PaginatedReport paginatedReport in analysis.TargetPaginatedReports)
         {
+            bool paginatedReportChanged = false;
             string targetServer = BuildPowerBiServer(analysis.TargetWorkspace.DisplayName);
             string targetDatabase = analysis.TargetSemanticModel.DisplayName;
+
+            // First fix the physical RDL definition. UpdateDatasources only changes the
+            // runtime connection in Power BI Service; it does not rewrite the RDL that
+            // Report Builder downloads. Keeping the RDL itself correct is required so
+            // rd:PowerBIWorkspaceName and the virtual server semantic-model ID point to QA.
+            ReportDefinitionResponse paginatedDefinition =
+                await _paginatedReportDefinitionBusiness.GetDefinitionAsync(
+                    analysis.TargetWorkspace.Id,
+                    paginatedReport.Id
+                );
+
+            await SaveBackupAsync(
+                backupDirectory,
+                $"Paginated-{SanitizeFileName(paginatedReport.DisplayName)}.json",
+                paginatedDefinition
+            );
+
+            paginatedDefinition.Definition.Format = "PaginatedReportDefinition";
+
+            bool rdlDefinitionChanged = UpdatePaginatedReportDefinition(
+                paginatedDefinition,
+                analysis
+            );
+
+            if (rdlDefinitionChanged)
+            {
+                await UpdateDefinitionAsync(
+                    $"workspaces/{analysis.TargetWorkspace.Id}/paginatedReports/{paginatedReport.Id}/updateDefinition?updateMetadata=false",
+                    new UpdateDefinitionRequest
+                    {
+                        Definition = paginatedDefinition.Definition
+                    }
+                );
+
+                await VerifyPaginatedReportDefinitionAsync(analysis, paginatedReport);
+                paginatedDefinitionChanged++;
+                paginatedReportChanged = true;
+            }
 
             PowerBiDatasourceResponse runtimeDatasources =
                 await GetPaginatedRuntimeDatasourcesAsync(
@@ -225,69 +266,76 @@ public class FixRdlVisualBusiness
                 runtimeDatasources.Value.All(x =>
                     IsTargetDatasource(x, targetServer, targetDatabase));
 
-            if (runtimeAlreadyCorrect)
+            if (!runtimeAlreadyCorrect)
             {
-                continue;
-            }
+                // Read the persisted RDL again because the physical remediation can also
+                // rename the datasource (for example wsdevcicd_* -> wsqacicd_*).
+                PaginatedReportInspectionResult inspection =
+                    await _paginatedReportDefinitionBusiness.GetInspectionAsync(
+                        analysis.TargetWorkspace.Id,
+                        paginatedReport.Id
+                    );
 
-            PaginatedReportInspectionResult inspection =
-                await _paginatedReportDefinitionBusiness.GetInspectionAsync(
-                    analysis.TargetWorkspace.Id,
-                    paginatedReport.Id
-                );
+                List<UpdateRdlDatasourceDetail> updateDetails = new();
 
-            List<UpdateRdlDatasourceDetail> updateDetails = new();
+                foreach (PaginatedDataSource dataSource in inspection.DataSources)
+                {
+                    if (string.IsNullOrWhiteSpace(dataSource.Name))
+                    {
+                        throw new InvalidOperationException(
+                            $"Paginated report '{paginatedReport.DisplayName}' contains a data source without a name."
+                        );
+                    }
 
-            foreach (PaginatedDataSource dataSource in inspection.DataSources)
-            {
-                if (string.IsNullOrWhiteSpace(dataSource.Name))
+                    updateDetails.Add(new UpdateRdlDatasourceDetail
+                    {
+                        DatasourceName = dataSource.Name,
+                        ConnectionDetails = new RdlDatasourceConnectionDetails
+                        {
+                            Server = targetServer,
+                            Database = targetDatabase
+                        }
+                    });
+                }
+
+                if (updateDetails.Count == 0)
                 {
                     throw new InvalidOperationException(
-                        $"Paginated report '{paginatedReport.DisplayName}' contains a data source without a name."
+                        $"Paginated report '{paginatedReport.DisplayName}' has no RDL data sources to update."
                     );
                 }
 
-                updateDetails.Add(new UpdateRdlDatasourceDetail
-                {
-                    DatasourceName = dataSource.Name,
-                    ConnectionDetails = new RdlDatasourceConnectionDetails
-                    {
-                        Server = targetServer,
-                        Database = targetDatabase
-                    }
-                });
-            }
-
-            if (updateDetails.Count == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Paginated report '{paginatedReport.DisplayName}' has no RDL data sources to update."
+                // UpdateDatasources for RDL reports requires the caller to own the
+                // paginated report data sources. TakeOver is idempotent for this use case.
+                await _powerBiApiClient.PostAsync(
+                    $"groups/{analysis.TargetWorkspace.Id}/reports/{paginatedReport.Id}/Default.TakeOver"
                 );
+
+                UpdateRdlDatasourcesRequest request = new()
+                {
+                    UpdateDetails = updateDetails
+                };
+
+                await _powerBiApiClient.PostAsync(
+                    $"groups/{analysis.TargetWorkspace.Id}/reports/{paginatedReport.Id}/Default.UpdateDatasources",
+                    request
+                );
+
+                paginatedRuntimeChanged++;
+                paginatedReportChanged = true;
             }
 
-            // UpdateDatasources for RDL reports requires the caller to own the
-            // paginated report data sources. TakeOver is idempotent for this use case
-            // and avoids a later ownership error after a deployment.
-            await _powerBiApiClient.PostAsync(
-                $"groups/{analysis.TargetWorkspace.Id}/reports/{paginatedReport.Id}/Default.TakeOver"
-            );
-
-            UpdateRdlDatasourcesRequest request = new()
+            if (paginatedReportChanged)
             {
-                UpdateDetails = updateDetails
-            };
-
-            await _powerBiApiClient.PostAsync(
-                $"groups/{analysis.TargetWorkspace.Id}/reports/{paginatedReport.Id}/Default.UpdateDatasources",
-                request
-            );
-
-            paginatedChanged++;
+                paginatedChanged++;
+            }
         }
 
         return $"Completed. Power BI report updated: {(reportChanged ? "Yes" : "No")}. " +
                $"Semantic model gateway updated: {(semanticModelGatewayChanged ? "Yes" : "No")}. " +
-               $"Paginated reports updated: {paginatedChanged}. Backup: {backupDirectory}";
+               $"Paginated RDL definitions updated: {paginatedDefinitionChanged}. " +
+               $"Paginated runtime datasources updated: {paginatedRuntimeChanged}. " +
+               $"Paginated reports changed: {paginatedChanged}. Backup: {backupDirectory}";
     }
 
     private void BuildPaginatedMappings(FixRdlAnalysis analysis)
@@ -415,6 +463,42 @@ public class FixRdlVisualBusiness
         {
             string targetServer = BuildPowerBiServer(analysis.TargetWorkspace.DisplayName);
             string targetDatabase = analysis.TargetSemanticModel.DisplayName;
+
+            PaginatedReportInspectionResult rdlInspection =
+                await _paginatedReportDefinitionBusiness.GetInspectionAsync(
+                    analysis.TargetWorkspace.Id,
+                    paginatedReport.Id
+                );
+
+            if (rdlInspection.DataSources.Count == 0)
+            {
+                analysis.Rows.Add(new FixRdlPlanRow
+                {
+                    ArtifactType = "Paginated Report",
+                    ArtifactName = paginatedReport.DisplayName,
+                    Property = "RDL definition",
+                    CurrentValue = "No embedded RDL data source found",
+                    TargetValue = FormatRdlDefinitionTarget(analysis, string.Empty),
+                    Status = "Error"
+                });
+            }
+            else
+            {
+                foreach (PaginatedDataSource dataSource in rdlInspection.DataSources)
+                {
+                    analysis.Rows.Add(new FixRdlPlanRow
+                    {
+                        ArtifactType = "Paginated Report",
+                        ArtifactName = paginatedReport.DisplayName,
+                        Property = "RDL definition",
+                        CurrentValue = FormatRdlDefinitionCurrent(dataSource),
+                        TargetValue = FormatRdlDefinitionTarget(analysis, dataSource.Name),
+                        Status = IsTargetRdlDefinition(dataSource, analysis)
+                            ? "Correct"
+                            : "Needs fix"
+                    });
+                }
+            }
 
             PowerBiDatasourceResponse runtimeDatasources =
                 await GetPaginatedRuntimeDatasourcesAsync(
@@ -808,6 +892,98 @@ public class FixRdlVisualBusiness
         }
     }
 
+    private async Task VerifyPaginatedReportDefinitionAsync(
+        FixRdlAnalysis analysis,
+        PaginatedReport paginatedReport)
+    {
+        PaginatedReportInspectionResult persisted =
+            await _paginatedReportDefinitionBusiness.GetInspectionAsync(
+                analysis.TargetWorkspace.Id,
+                paginatedReport.Id
+            );
+
+        if (persisted.DataSources.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Fabric accepted the paginated report update, but '{paginatedReport.DisplayName}' " +
+                "does not contain an embedded RDL data source after the update."
+            );
+        }
+
+        List<PaginatedDataSource> invalid = persisted.DataSources
+            .Where(x => !IsTargetRdlDefinition(x, analysis))
+            .ToList();
+
+        if (invalid.Count > 0)
+        {
+            string details = string.Join(
+                " | ",
+                invalid.Select(FormatRdlDefinitionCurrent)
+            );
+
+            throw new InvalidOperationException(
+                $"Fabric accepted the paginated report definition update, but '{paginatedReport.DisplayName}' " +
+                $"was not persisted with the expected QA semantic model reference. Found: {details}"
+            );
+        }
+    }
+
+    private static bool IsTargetRdlDefinition(
+        PaginatedDataSource dataSource,
+        FixRdlAnalysis analysis)
+    {
+        if (dataSource == null)
+        {
+            return false;
+        }
+
+        string targetDatasourceName = BuildTargetRdlDatasourceName(
+            dataSource.Name,
+            analysis.SourceWorkspace,
+            analysis.TargetWorkspace
+        );
+
+        string semanticModelId = ExtractSemanticModelId(dataSource.ConnectionString);
+
+        return string.Equals(
+                dataSource.Name,
+                targetDatasourceName,
+                StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(
+                dataSource.PowerBIWorkspaceName,
+                analysis.TargetWorkspace.DisplayName,
+                StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(
+                dataSource.PowerBIDatasetName,
+                analysis.TargetSemanticModel.DisplayName,
+                StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(
+                semanticModelId,
+                analysis.TargetSemanticModel.Id,
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FormatRdlDefinitionCurrent(PaginatedDataSource dataSource)
+    {
+        string semanticModelId = ExtractSemanticModelId(dataSource.ConnectionString);
+        return $"Name={dataSource.Name}; Workspace={dataSource.PowerBIWorkspaceName}; " +
+               $"Dataset={dataSource.PowerBIDatasetName}; SemanticModelId={semanticModelId}";
+    }
+
+    private static string FormatRdlDefinitionTarget(
+        FixRdlAnalysis analysis,
+        string currentDatasourceName)
+    {
+        string targetDatasourceName = BuildTargetRdlDatasourceName(
+            currentDatasourceName,
+            analysis.SourceWorkspace,
+            analysis.TargetWorkspace
+        );
+
+        return $"Name={targetDatasourceName}; Workspace={analysis.TargetWorkspace.DisplayName}; " +
+               $"Dataset={analysis.TargetSemanticModel.DisplayName}; SemanticModelId={analysis.TargetSemanticModel.Id}";
+    }
+
     private static bool UpdatePaginatedReportDefinition(
         ReportDefinitionResponse definition,
         FixRdlAnalysis analysis)
@@ -823,10 +999,49 @@ public class FixRdlVisualBusiness
 
             XDocument document = LoadXmlDocumentFromBase64(part);
             bool partChanged = false;
+            Dictionary<string, string> datasourceNameMappings =
+                new(StringComparer.OrdinalIgnoreCase);
+
+            foreach (XElement dataSourceElement in document
+                .Descendants()
+                .Where(x => string.Equals(
+                    x.Name.LocalName,
+                    "DataSource",
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                XAttribute nameAttribute = dataSourceElement.Attributes()
+                    .FirstOrDefault(x => string.Equals(
+                        x.Name.LocalName,
+                        "Name",
+                        StringComparison.OrdinalIgnoreCase));
+
+                if (nameAttribute != null && !string.IsNullOrWhiteSpace(nameAttribute.Value))
+                {
+                    string targetName = BuildTargetRdlDatasourceName(
+                        nameAttribute.Value,
+                        analysis.SourceWorkspace,
+                        analysis.TargetWorkspace
+                    );
+
+                    datasourceNameMappings[nameAttribute.Value] = targetName;
+
+                    if (!string.Equals(
+                        nameAttribute.Value,
+                        targetName,
+                        StringComparison.Ordinal))
+                    {
+                        nameAttribute.Value = targetName;
+                        partChanged = true;
+                    }
+                }
+            }
 
             foreach (XElement element in document.Descendants())
             {
-                if (string.Equals(element.Name.LocalName, "ConnectString", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(
+                    element.Name.LocalName,
+                    "ConnectString",
+                    StringComparison.OrdinalIgnoreCase))
                 {
                     string updated = UpdateConnectionString(
                         element.Value,
@@ -842,7 +1057,10 @@ public class FixRdlVisualBusiness
                         partChanged = true;
                     }
                 }
-                else if (string.Equals(element.Name.LocalName, "PowerBIWorkspaceName", StringComparison.OrdinalIgnoreCase))
+                else if (string.Equals(
+                    element.Name.LocalName,
+                    "PowerBIWorkspaceName",
+                    StringComparison.OrdinalIgnoreCase))
                 {
                     if (!string.Equals(
                         element.Value,
@@ -853,7 +1071,10 @@ public class FixRdlVisualBusiness
                         partChanged = true;
                     }
                 }
-                else if (string.Equals(element.Name.LocalName, "PowerBIDatasetName", StringComparison.OrdinalIgnoreCase))
+                else if (string.Equals(
+                    element.Name.LocalName,
+                    "PowerBIDatasetName",
+                    StringComparison.OrdinalIgnoreCase))
                 {
                     if (!string.Equals(
                         element.Value,
@@ -864,16 +1085,74 @@ public class FixRdlVisualBusiness
                         partChanged = true;
                     }
                 }
+                else if (string.Equals(
+                    element.Name.LocalName,
+                    "DataSourceName",
+                    StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(element.Value))
+                {
+                    string targetName = datasourceNameMappings.TryGetValue(
+                        element.Value,
+                        out string mappedName)
+                        ? mappedName
+                        : BuildTargetRdlDatasourceName(
+                            element.Value,
+                            analysis.SourceWorkspace,
+                            analysis.TargetWorkspace
+                        );
+
+                    if (!string.Equals(
+                        element.Value,
+                        targetName,
+                        StringComparison.Ordinal))
+                    {
+                        element.Value = targetName;
+                        partChanged = true;
+                    }
+                }
             }
 
             if (partChanged)
             {
                 part.Payload = EncodeXmlDocumentBase64(document);
+                part.PayloadType = "InlineBase64";
                 changed = true;
             }
         }
 
         return changed;
+    }
+
+    private static string BuildTargetRdlDatasourceName(
+        string currentName,
+        Workspace sourceWorkspace,
+        Workspace targetWorkspace)
+    {
+        if (string.IsNullOrWhiteSpace(currentName))
+        {
+            return currentName;
+        }
+
+        string sourcePrefix = NormalizeWorkspaceForRdlDatasource(sourceWorkspace.DisplayName);
+        string targetPrefix = NormalizeWorkspaceForRdlDatasource(targetWorkspace.DisplayName);
+
+        if (!string.IsNullOrWhiteSpace(sourcePrefix) &&
+            currentName.StartsWith(sourcePrefix + "_", StringComparison.OrdinalIgnoreCase))
+        {
+            return targetPrefix + currentName[sourcePrefix.Length..];
+        }
+
+        return currentName;
+    }
+
+    private static string NormalizeWorkspaceForRdlDatasource(string workspaceName)
+    {
+        if (string.IsNullOrWhiteSpace(workspaceName))
+        {
+            return string.Empty;
+        }
+
+        return Regex.Replace(workspaceName, @"[\s-]+", string.Empty);
     }
 
     private static string UpdateConnectionString(

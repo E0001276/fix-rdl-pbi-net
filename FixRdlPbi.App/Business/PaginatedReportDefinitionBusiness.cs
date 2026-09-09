@@ -30,7 +30,7 @@ public class PaginatedReportDefinitionBusiness
         };
     }
 
-    private async Task<ReportDefinitionResponse> GetDefinitionAsync(
+    public async Task<ReportDefinitionResponse> GetDefinitionAsync(
         string workspaceId,
         string paginatedReportId)
     {
@@ -183,7 +183,9 @@ public class PaginatedReportDefinitionBusiness
                     dataSourceElement,
                     "DataSourceReference"
                 ),
-                DataSourceId = GetChildValue(dataSourceElement, "DataSourceID")
+                DataSourceId = GetChildValue(dataSourceElement, "DataSourceID"),
+                PowerBIWorkspaceName = GetChildValue(dataSourceElement, "PowerBIWorkspaceName"),
+                PowerBIDatasetName = GetChildValue(dataSourceElement, "PowerBIDatasetName")
             };
 
             result.Add(dataSource);

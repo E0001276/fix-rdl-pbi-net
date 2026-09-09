@@ -11,4 +11,8 @@ public class PaginatedDataSource
     public string DataSourceReference { get; set; } = string.Empty;
 
     public string DataSourceId { get; set; } = string.Empty;
+
+    public string PowerBIWorkspaceName { get; set; } = string.Empty;
+
+    public string PowerBIDatasetName { get; set; } = string.Empty;
 }
