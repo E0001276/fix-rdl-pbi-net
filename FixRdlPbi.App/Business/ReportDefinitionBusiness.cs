@@ -565,10 +565,15 @@ public class ReportDefinitionBusiness
             System.Diagnostics.Debug.WriteLine(visualJson);
             System.Diagnostics.Debug.WriteLine("============================================================");
 
-            string workspaceId = FindLiteralValueRecursive(visualRoot, "workspaceId");
-
-            //string reportId = FindLiteralValueRecursive(visualRoot, "reportId");
-            string itemId = FindLiteralValueRecursive(visualRoot, "itemId");
+            string workspaceId = string.Empty;
+            string itemId = string.Empty;
+            string referenceKind = string.Empty;
+            bool isCanonicalItemLocation = TryGetPbirRdlReference(
+                visualRoot,
+                out workspaceId,
+                out itemId,
+                out referenceKind
+            );
 
             string pageName = GetPageNameFromVisualPath(visualPart.Path, definition);
 
@@ -576,13 +581,71 @@ public class ReportDefinitionBusiness
                 new RdlVisualReference
                 {
                     PageName = pageName,
+                    VisualPath = visualPart.Path,
                     WorkspaceId = workspaceId,
-                    ReportId = itemId
+                    ReportId = itemId,
+                    ReferenceKind = referenceKind,
+                    IsCanonicalItemLocation = isCanonicalItemLocation
                 }
             );
         }
 
         return result;
+    }
+
+
+    private static bool TryGetPbirRdlReference(
+        JsonElement visualRoot,
+        out string workspaceId,
+        out string itemId,
+        out string referenceKind)
+    {
+        workspaceId = string.Empty;
+        itemId = string.Empty;
+        referenceKind = string.Empty;
+
+        if (!visualRoot.TryGetProperty("visual", out JsonElement visual) ||
+            !visual.TryGetProperty("objects", out JsonElement objects) ||
+            !objects.TryGetProperty("reportInfo", out JsonElement reportInfo) ||
+            reportInfo.ValueKind != JsonValueKind.Array ||
+            reportInfo.GetArrayLength() == 0 ||
+            !reportInfo[0].TryGetProperty("properties", out JsonElement properties) ||
+            !properties.TryGetProperty("reference", out JsonElement reference))
+        {
+            return false;
+        }
+
+        if (reference.TryGetProperty("kind", out JsonElement kindElement))
+        {
+            referenceKind = kindElement.GetString() ?? string.Empty;
+        }
+
+        if (!reference.TryGetProperty("byReference", out JsonElement byReference))
+        {
+            return false;
+        }
+
+        workspaceId = GetPbirLiteralValue(byReference, "workspaceId");
+        itemId = GetPbirLiteralValue(byReference, "itemId");
+
+        return
+            string.Equals(referenceKind, "ItemLocation", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(workspaceId) &&
+            !string.IsNullOrWhiteSpace(itemId);
+    }
+
+    private static string GetPbirLiteralValue(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement property) ||
+            !property.TryGetProperty("expr", out JsonElement expr) ||
+            !expr.TryGetProperty("Literal", out JsonElement literal) ||
+            !literal.TryGetProperty("Value", out JsonElement value))
+        {
+            return string.Empty;
+        }
+
+        string result = value.GetString();
+        return string.IsNullOrWhiteSpace(result) ? string.Empty : result.Trim('\'');
     }
 
     private static string GetPbirVisualType(JsonElement visualRoot)

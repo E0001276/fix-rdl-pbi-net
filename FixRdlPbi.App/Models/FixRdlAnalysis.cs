@@ -28,6 +28,8 @@ public class FixRdlAnalysis
 
     public List<PaginatedReport> TargetPaginatedReports { get; set; } = new();
 
+    public List<SemanticModelGatewayMapping> SemanticModelGatewayMappings { get; set; } = new();
+
     public List<FixRdlPlanRow> Rows { get; set; } = new();
 
     public bool HasChanges => Rows.Any(x => string.Equals(x.Status, "Needs fix", StringComparison.OrdinalIgnoreCase));

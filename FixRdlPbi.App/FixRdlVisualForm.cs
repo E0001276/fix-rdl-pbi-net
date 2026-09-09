@@ -145,8 +145,8 @@ public partial class FixRdlVisualForm : Form
             dgvPlan.DataSource = _analysis.Rows;
             lblTargetReportValue.Text = $"{_analysis.TargetReport.DisplayName} ({_analysis.TargetReport.Id})";
             lblTargetModelValue.Text = $"{_analysis.TargetSemanticModel.DisplayName} ({_analysis.TargetSemanticModel.Id})";
-            btnApply.Enabled = _analysis.HasChanges &&
-                !_analysis.Rows.Any(x => string.Equals(x.Status, "Error", StringComparison.OrdinalIgnoreCase));
+            btnApply.Enabled = !_analysis.Rows.Any(x => string.Equals(x.Status, "Error", StringComparison.OrdinalIgnoreCase)) &&
+                (_analysis.HasChanges || _analysis.TargetInspection.RdlVisualReferences.Count > 0);
 
             int changes = _analysis.Rows.Count(x => string.Equals(x.Status, "Needs fix", StringComparison.OrdinalIgnoreCase));
             int errors = _analysis.Rows.Count(x => string.Equals(x.Status, "Error", StringComparison.OrdinalIgnoreCase));
@@ -177,21 +177,19 @@ public partial class FixRdlVisualForm : Form
             throw new InvalidOperationException("The analysis contains errors. Resolve them before applying fixes.");
         }
 
-        if (!_analysis.HasChanges)
-        {
-            MessageBox.Show(
-                "No changes are required.",
-                "Fix RDL Visual",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information
-            );
-            return;
-        }
+        bool forceRdlRelink = !_analysis.HasChanges &&
+            _analysis.TargetInspection.RdlVisualReferences.Count > 0;
+
+        string forceMessage = forceRdlRelink
+            ? "No differences were detected in the stored IDs, but the RDL visual references will be recreated using a canonical ItemLocation binding and verified after persistence.\r\n\r\n"
+            : string.Empty;
 
         DialogResult answer = MessageBox.Show(
             $"This will update item definitions in target workspace '{_analysis.TargetWorkspace.DisplayName}'.\r\n\r\n" +
+            forceMessage +
             "The operation will:\r\n" +
             "- Rebind the Power BI report to the target semantic model.\r\n" +
+            "- Bind the target semantic model Oracle source to the matching on-premises gateway datasource.\r\n" +
             "- Replace RDL Visual references with target paginated report IDs.\r\n" +
             "- Rebind the target paginated reports to the target semantic model.\r\n\r\n" +
             "A local backup of the current target definitions will be created first.\r\n\r\nContinue?",
@@ -210,7 +208,7 @@ public partial class FixRdlVisualForm : Form
 
         try
         {
-            string result = await _fixBusiness.ApplyAsync(_analysis);
+            string result = await _fixBusiness.ApplyAsync(_analysis, forceRdlRelink);
             AppendLog(result);
 
             MessageBox.Show(
@@ -244,8 +242,9 @@ public partial class FixRdlVisualForm : Form
         cboSourceReport.Enabled = !busy;
         btnRefresh.Enabled = !busy;
         btnAnalyze.Enabled = !busy;
-        btnApply.Enabled = !busy && _analysis != null && _analysis.HasChanges &&
-            !_analysis.Rows.Any(x => string.Equals(x.Status, "Error", StringComparison.OrdinalIgnoreCase));
+        btnApply.Enabled = !busy && _analysis != null &&
+            !_analysis.Rows.Any(x => string.Equals(x.Status, "Error", StringComparison.OrdinalIgnoreCase)) &&
+            (_analysis.HasChanges || _analysis.TargetInspection.RdlVisualReferences.Count > 0);
 
         Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         lblStatus.Text = status;

@@ -1,21 +1,33 @@
 # fix-rdl-pbi-net
-Windows Forms application built with .NET 9 to fix Power BI paginated report visual references.
+
+Windows Forms application built with .NET 9 to remediate Power BI/Fabric links after promoting reports between workspaces.
 
 ## Fix RDL Visual
 
-The **Fabric > Fix RDL Visual** menu opens a remediation form for promoted Power BI reports that contain RDL visuals.
+Open the form from **Fabric > Fix RDL Visual**.
 
-Workflow:
-1. Select the source workspace (for example DEV).
-2. Select the target workspace (for example QA).
-3. Select the source Power BI report.
-4. Click **Analyze**. The application matches the target Power BI report, semantic model, and paginated reports by display name and compares the actual item IDs in both workspaces.
-5. Review the remediation plan.
-6. Click **Apply fixes**. Before changing the target workspace, the application saves the current target item definitions under the local `backup` folder.
+The remediation can:
+- Rebind the target Power BI report to the target semantic model.
+- Recreate each PBIR RDL visual reference as a canonical `ItemLocation` reference using the target workspace ID and the target paginated report item ID.
+- Verify the RDL visual references again after Fabric persists the updated report definition. The operation fails if Fabric does not persist the expected target IDs.
+- Rebind paginated-report runtime data sources to the target semantic model using the Power BI REST API.
+- Bind the semantic model to the matching gateway when required.
 
-The remediation uses Microsoft Fabric REST APIs to update item definitions. It can:
-- Rebind the target Power BI report to the target semantic model through `definition.pbir`.
-- Rewrite RDL visual `workspaceId` and paginated report `itemId` references in PBIR visual definitions.
-- Rewrite paginated report RDL connection strings so they point to the target semantic model, and update the embedded Power BI workspace/model metadata.
+## Forced RDL relink
 
-Only the target workspace is modified. Source workspace definitions are read-only inputs used to resolve source-to-target mappings.
+If **Analyze** reports zero changes but an RDL visual still does not render or Power BI asks you to select the paginated report again, **Apply fixes remains enabled**.
+
+In that case the application performs a forced RDL relink:
+1. It recreates the complete `visual.objects.reportInfo[0].properties.reference` object.
+2. It writes `kind = ItemLocation`.
+3. It writes the target `workspaceId` and target paginated-report `itemId` as literal expressions.
+4. It sends the report definition to Fabric.
+5. It downloads the persisted definition again and verifies each page against the expected target paginated report.
+
+This is intentionally stronger than only replacing GUID strings in the existing JSON.
+
+## Safety
+
+Only the target workspace is modified. Before applying changes, the current target definitions are saved under the local `backup` folder.
+
+The project targets `net9.0-windows` and uses `<Nullable>disable</Nullable>`.

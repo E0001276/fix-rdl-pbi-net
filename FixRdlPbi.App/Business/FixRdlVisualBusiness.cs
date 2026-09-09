@@ -107,6 +107,11 @@ public class FixRdlVisualBusiness
             targetWorkspace.DisplayName
         );
 
+        analysis.SemanticModelGatewayMappings = await ResolveSemanticModelGatewayMappingsAsync(
+            analysis.TargetWorkspace,
+            analysis.TargetSemanticModel
+        );
+
         analysis.SourcePaginatedById = sourcePaginated
             .ToDictionary(x => x.Id, StringComparer.OrdinalIgnoreCase);
 
@@ -128,7 +133,7 @@ public class FixRdlVisualBusiness
         return analysis;
     }
 
-    public async Task<string> ApplyAsync(FixRdlAnalysis analysis)
+    public async Task<string> ApplyAsync(FixRdlAnalysis analysis, bool forceRdlRelink = false)
     {
         if (analysis == null)
         {
@@ -150,7 +155,8 @@ public class FixRdlVisualBusiness
 
         bool reportChanged = UpdatePowerBiReportDefinition(
             targetReportDefinition,
-            analysis
+            analysis,
+            forceRdlRelink
         );
 
         if (reportChanged)
@@ -162,6 +168,44 @@ public class FixRdlVisualBusiness
                     Definition = targetReportDefinition.Definition
                 }
             );
+
+            await VerifyRdlVisualBindingsAsync(analysis);
+        }
+
+        bool semanticModelGatewayChanged = false;
+
+        List<SemanticModelGatewayMapping> gatewayMappingsToFix = analysis.SemanticModelGatewayMappings
+            .Where(x => x.NeedsFix)
+            .ToList();
+
+        if (gatewayMappingsToFix.Count > 0)
+        {
+            List<string> gatewayIds = analysis.SemanticModelGatewayMappings
+                .Where(x => x.Gateway != null)
+                .Select(x => x.Gateway.Id)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (gatewayIds.Count != 1)
+            {
+                throw new InvalidOperationException(
+                    "The semantic model could not be resolved to a single on-premises gateway. " +
+                    "Automatic remediation was stopped to avoid binding to the wrong gateway."
+                );
+            }
+
+            BindToGatewayRequest bindRequest = new()
+            {
+                GatewayObjectId = gatewayIds[0],
+                DatasourceObjectIds = null
+            };
+
+            await _powerBiApiClient.PostAsync(
+                $"groups/{analysis.TargetWorkspace.Id}/datasets/{analysis.TargetSemanticModel.Id}/Default.BindToGateway",
+                bindRequest
+            );
+
+            semanticModelGatewayChanged = true;
         }
 
         int paginatedChanged = 0;
@@ -242,6 +286,7 @@ public class FixRdlVisualBusiness
         }
 
         return $"Completed. Power BI report updated: {(reportChanged ? "Yes" : "No")}. " +
+               $"Semantic model gateway updated: {(semanticModelGatewayChanged ? "Yes" : "No")}. " +
                $"Paginated reports updated: {paginatedChanged}. Backup: {backupDirectory}";
     }
 
@@ -310,6 +355,25 @@ public class FixRdlVisualBusiness
                 : "Needs fix"
         });
 
+        foreach (SemanticModelGatewayMapping mapping in analysis.SemanticModelGatewayMappings)
+        {
+            PowerBiDatasource modelDatasource = mapping.ModelDatasource;
+            string currentValue = FormatSemanticModelBindingCurrent(modelDatasource);
+            string targetValue = mapping.Gateway != null
+                ? FormatSemanticModelBindingTarget(mapping.Gateway, mapping.GatewayDatasource)
+                : mapping.Error;
+
+            analysis.Rows.Add(new FixRdlPlanRow
+            {
+                ArtifactType = "Semantic Model",
+                ArtifactName = analysis.TargetSemanticModel.DisplayName,
+                Property = $"Gateway binding ({modelDatasource.DatasourceType})",
+                CurrentValue = currentValue,
+                TargetValue = targetValue,
+                Status = mapping.Status
+            });
+        }
+
         foreach (RdlVisualReference targetReference in analysis.TargetInspection.RdlVisualReferences)
         {
             string desiredTargetId = ResolveDesiredPaginatedId(analysis, targetReference);
@@ -338,7 +402,9 @@ public class FixRdlVisualBusiness
                 Property = desiredReport.DisplayName,
                 CurrentValue = targetReference.ReportId,
                 TargetValue = desiredTargetId,
-                Status = EqualsIgnoreCase(targetReference.ReportId, desiredTargetId)
+                Status = targetReference.IsCanonicalItemLocation
+                    && string.Equals(targetReference.ReferenceKind, "ItemLocation", StringComparison.OrdinalIgnoreCase)
+                    && EqualsIgnoreCase(targetReference.ReportId, desiredTargetId)
                     && EqualsIgnoreCase(targetReference.WorkspaceId, analysis.TargetWorkspace.Id)
                     ? "Correct"
                     : "Needs fix"
@@ -432,7 +498,8 @@ public class FixRdlVisualBusiness
 
     private static bool UpdatePowerBiReportDefinition(
         ReportDefinitionResponse definition,
-        FixRdlAnalysis analysis)
+        FixRdlAnalysis analysis,
+        bool forceRdlRelink)
     {
         bool changed = false;
 
@@ -490,7 +557,32 @@ public class FixRdlVisualBusiness
                 continue;
             }
 
-            bool partChanged = UpdateRdlVisualNodes(json, analysis);
+            bool partChanged = false;
+
+            if (part.Path.EndsWith("/visual.json", StringComparison.OrdinalIgnoreCase))
+            {
+                RdlVisualReference targetReference = analysis.TargetInspection.RdlVisualReferences
+                    .FirstOrDefault(x => string.Equals(
+                        x.VisualPath,
+                        part.Path,
+                        StringComparison.OrdinalIgnoreCase
+                    ));
+
+                if (targetReference != null)
+                {
+                    string desiredItemId = ResolveDesiredPaginatedId(analysis, targetReference);
+
+                    if (!string.IsNullOrWhiteSpace(desiredItemId))
+                    {
+                        partChanged = UpdateSingleRdlVisual(
+                            json,
+                            analysis.TargetWorkspace.Id,
+                            desiredItemId,
+                            forceRdlRelink
+                        );
+                    }
+                }
+            }
 
             if (partChanged)
             {
@@ -502,73 +594,125 @@ public class FixRdlVisualBusiness
         return changed;
     }
 
-    private static bool UpdateRdlVisualNodes(JsonNode node, FixRdlAnalysis analysis)
+    private static bool UpdateSingleRdlVisual(
+        JsonNode root,
+        string targetWorkspaceId,
+        string targetItemId,
+        bool forceRdlRelink)
     {
-        bool changed = false;
-
-        if (node is JsonObject obj)
+        if (root is not JsonObject rootObject ||
+            rootObject["visual"] is not JsonObject visualObject ||
+            !TryGetStringValue(visualObject["visualType"], out string visualType) ||
+            !string.Equals(visualType, "rdlVisual", StringComparison.OrdinalIgnoreCase))
         {
-            if (obj["visual"] is JsonObject visualObject &&
-                TryGetStringValue(visualObject["visualType"], out string visualType) &&
-                string.Equals(visualType, "rdlVisual", StringComparison.OrdinalIgnoreCase))
-            {
-                JsonObject referenceObject = GetRdlByReferenceObject(visualObject);
-
-                if (referenceObject != null)
-                {
-                    string currentItemId = GetLiteralValue(referenceObject, "itemId");
-                    string currentWorkspaceId = GetLiteralValue(referenceObject, "workspaceId");
-                    string desiredItemId = string.Empty;
-
-                    if (analysis.SourcePaginatedIdToTargetId.TryGetValue(currentItemId, out string mapped))
-                    {
-                        desiredItemId = mapped;
-                    }
-                    else if (analysis.TargetCurrentPaginatedIdToTargetId.TryGetValue(currentItemId, out mapped))
-                    {
-                        desiredItemId = mapped;
-                    }
-                    else if (analysis.TargetPaginatedReports.Any(x => EqualsIgnoreCase(x.Id, currentItemId)))
-                    {
-                        desiredItemId = currentItemId;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(desiredItemId) &&
-                        !EqualsIgnoreCase(currentItemId, desiredItemId) &&
-                        SetLiteralValue(referenceObject, "itemId", desiredItemId))
-                    {
-                        changed = true;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(currentWorkspaceId) &&
-                        !EqualsIgnoreCase(currentWorkspaceId, analysis.TargetWorkspace.Id) &&
-                        SetLiteralValue(referenceObject, "workspaceId", analysis.TargetWorkspace.Id))
-                    {
-                        changed = true;
-                    }
-                }
-            }
-
-            foreach (KeyValuePair<string, JsonNode> property in obj.ToList())
-            {
-                if (property.Value != null)
-                {
-                    changed |= UpdateRdlVisualNodes(property.Value, analysis);
-                }
-            }
-        }
-        else if (node is JsonArray array)
-        {
-            foreach (JsonNode child in array)
-            {
-                if (child != null)
-                {
-                    changed |= UpdateRdlVisualNodes(child, analysis);
-                }
-            }
+            return false;
         }
 
-        return changed;
+        return ReplaceRdlReference(
+            visualObject,
+            targetWorkspaceId,
+            targetItemId,
+            forceRdlRelink
+        );
+    }
+
+    private static bool ReplaceRdlReference(
+        JsonObject visualObject,
+        string targetWorkspaceId,
+        string targetItemId,
+        bool forceRdlRelink)
+    {
+        JsonObject objectsObject = visualObject["objects"] as JsonObject;
+        if (objectsObject == null)
+        {
+            objectsObject = new JsonObject();
+            visualObject["objects"] = objectsObject;
+        }
+
+        JsonArray reportInfoArray = objectsObject["reportInfo"] as JsonArray;
+        if (reportInfoArray == null)
+        {
+            reportInfoArray = new JsonArray();
+            objectsObject["reportInfo"] = reportInfoArray;
+        }
+
+        JsonObject reportInfoObject;
+        if (reportInfoArray.Count == 0 || reportInfoArray[0] is not JsonObject existingReportInfo)
+        {
+            reportInfoObject = new JsonObject();
+            if (reportInfoArray.Count == 0)
+            {
+                reportInfoArray.Add(reportInfoObject);
+            }
+            else
+            {
+                reportInfoArray[0] = reportInfoObject;
+            }
+        }
+        else
+        {
+            reportInfoObject = existingReportInfo;
+        }
+
+        JsonObject propertiesObject = reportInfoObject["properties"] as JsonObject;
+        if (propertiesObject == null)
+        {
+            propertiesObject = new JsonObject();
+            reportInfoObject["properties"] = propertiesObject;
+        }
+
+        JsonObject existingReference = propertiesObject["reference"] as JsonObject;
+        string existingKind = string.Empty;
+        string existingWorkspaceId = string.Empty;
+        string existingItemId = string.Empty;
+
+        if (existingReference != null)
+        {
+            TryGetStringValue(existingReference["kind"], out existingKind);
+            if (existingReference["byReference"] is JsonObject existingByReference)
+            {
+                existingWorkspaceId = GetLiteralValue(existingByReference, "workspaceId");
+                existingItemId = GetLiteralValue(existingByReference, "itemId");
+            }
+        }
+
+        bool alreadyCanonical =
+            string.Equals(existingKind, "ItemLocation", StringComparison.OrdinalIgnoreCase) &&
+            EqualsIgnoreCase(existingWorkspaceId, targetWorkspaceId) &&
+            EqualsIgnoreCase(existingItemId, targetItemId);
+
+        if (alreadyCanonical && !forceRdlRelink)
+        {
+            return false;
+        }
+
+        JsonObject byReference = new()
+        {
+            ["itemId"] = CreateLiteralProperty(targetItemId),
+            ["workspaceId"] = CreateLiteralProperty(targetWorkspaceId)
+        };
+
+        propertiesObject["reference"] = new JsonObject
+        {
+            ["kind"] = "ItemLocation",
+            ["byReference"] = byReference
+        };
+
+        return true;
+    }
+
+    private static JsonObject CreateLiteralProperty(string value)
+    {
+        return new JsonObject
+        {
+            ["expr"] = new JsonObject
+            {
+                ["Literal"] = new JsonObject
+                {
+                    ["Value"] = $"'{value}'"
+                }
+            }
+        };
     }
 
     private static JsonObject GetRdlByReferenceObject(JsonObject visualObject)
@@ -626,6 +770,42 @@ public class FixRdlVisualBusiness
 
         value = stringValue;
         return true;
+    }
+
+    private async Task VerifyRdlVisualBindingsAsync(FixRdlAnalysis analysis)
+    {
+        ReportInspectionResult persisted = await _reportDefinitionBusiness.GetInspectionAsync(
+            analysis.TargetWorkspace.Id,
+            analysis.TargetWorkspace.DisplayName,
+            analysis.TargetReport.Id,
+            analysis.TargetReport.DisplayName
+        );
+
+        foreach (RdlVisualReference sourceReference in analysis.SourceInspection.RdlVisualReferences)
+        {
+            if (!analysis.SourcePaginatedById.TryGetValue(sourceReference.ReportId, out PaginatedReport sourcePaginated) ||
+                !analysis.TargetPaginatedByName.TryGetValue(sourcePaginated.DisplayName, out PaginatedReport expectedTarget))
+            {
+                continue;
+            }
+
+            RdlVisualReference persistedReference = persisted.RdlVisualReferences.FirstOrDefault(
+                x => string.Equals(x.PageName, sourceReference.PageName, StringComparison.OrdinalIgnoreCase)
+            );
+
+            if (persistedReference == null ||
+                !persistedReference.IsCanonicalItemLocation ||
+                !EqualsIgnoreCase(persistedReference.WorkspaceId, analysis.TargetWorkspace.Id) ||
+                !EqualsIgnoreCase(persistedReference.ReportId, expectedTarget.Id))
+            {
+                throw new InvalidOperationException(
+                    $"Fabric accepted the report update, but RDL visual '{sourceReference.PageName}' was not persisted " +
+                    $"with the expected target binding. Expected workspace '{analysis.TargetWorkspace.Id}' and item " +
+                    $"'{expectedTarget.Id}', but found workspace '{persistedReference?.WorkspaceId ?? "(missing)"}' and item " +
+                    $"'{persistedReference?.ReportId ?? "(missing)"}'."
+                );
+            }
+        }
     }
 
     private static bool UpdatePaginatedReportDefinition(
@@ -737,6 +917,143 @@ public class FixRdlVisualBusiness
         );
 
         return result;
+    }
+
+    private async Task<List<SemanticModelGatewayMapping>> ResolveSemanticModelGatewayMappingsAsync(
+        Workspace targetWorkspace,
+        SemanticModel targetSemanticModel)
+    {
+        PowerBiDatasourceResponse datasourceResponse = await _powerBiApiClient.GetAsync<PowerBiDatasourceResponse>(
+            $"groups/{targetWorkspace.Id}/datasets/{targetSemanticModel.Id}/datasources"
+        );
+
+        List<PowerBiDatasource> modelDatasources = datasourceResponse.Value
+            .Where(x => string.Equals(x.DatasourceType, "Oracle", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        List<SemanticModelGatewayMapping> mappings = new();
+
+        if (modelDatasources.Count == 0)
+        {
+            return mappings;
+        }
+
+        PowerBiGatewayResponse gatewaysResponse;
+
+        try
+        {
+            gatewaysResponse = await _powerBiApiClient.GetAsync<PowerBiGatewayResponse>(
+                $"groups/{targetWorkspace.Id}/datasets/{targetSemanticModel.Id}/Default.DiscoverGateways"
+            );
+        }
+        catch (HttpRequestException ex)
+        {
+            foreach (PowerBiDatasource modelDatasource in modelDatasources)
+            {
+                mappings.Add(new SemanticModelGatewayMapping
+                {
+                    ModelDatasource = modelDatasource,
+                    Status = "Error",
+                    Error = "Unable to discover gateways that can bind this semantic model. " + ex.Message
+                });
+            }
+
+            return mappings;
+        }
+
+        List<PowerBiGateway> gateways = gatewaysResponse.Value
+            .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.First())
+            .ToList();
+
+        foreach (PowerBiDatasource modelDatasource in modelDatasources)
+        {
+            if (!string.IsNullOrWhiteSpace(modelDatasource.GatewayId))
+            {
+                PowerBiGateway currentGateway = gateways.FirstOrDefault(x =>
+                    EqualsIgnoreCase(x.Id, modelDatasource.GatewayId));
+
+                if (currentGateway != null && !string.IsNullOrWhiteSpace(modelDatasource.DatasourceId))
+                {
+                    mappings.Add(new SemanticModelGatewayMapping
+                    {
+                        ModelDatasource = modelDatasource,
+                        Gateway = currentGateway,
+                        Status = "Correct"
+                    });
+                    continue;
+                }
+            }
+
+            if (gateways.Count == 1)
+            {
+                mappings.Add(new SemanticModelGatewayMapping
+                {
+                    ModelDatasource = modelDatasource,
+                    Gateway = gateways[0],
+                    Status = "Needs fix"
+                });
+                continue;
+            }
+
+            if (gateways.Count == 0)
+            {
+                mappings.Add(new SemanticModelGatewayMapping
+                {
+                    ModelDatasource = modelDatasource,
+                    Status = "Error",
+                    Error = "No on-premises gateway was discovered for " +
+                        FormatDatasourceConnection(modelDatasource) +
+                        ". Verify that a matching Oracle datasource exists and that the current user is allowed to use it."
+                });
+                continue;
+            }
+
+            string gatewayNames = string.Join(", ", gateways.Select(x => $"{x.Name} ({x.Id})"));
+
+            mappings.Add(new SemanticModelGatewayMapping
+            {
+                ModelDatasource = modelDatasource,
+                Status = "Error",
+                Error = "More than one gateway can bind this semantic model. Automatic selection is unsafe. " +
+                    $"Candidates: {gatewayNames}"
+            });
+        }
+
+        return mappings;
+    }
+
+    private static string FormatSemanticModelBindingCurrent(PowerBiDatasource datasource)
+    {
+        string gateway = string.IsNullOrWhiteSpace(datasource.GatewayId)
+            ? "Unbound"
+            : datasource.GatewayId;
+        string datasourceId = string.IsNullOrWhiteSpace(datasource.DatasourceId)
+            ? "Unbound"
+            : datasource.DatasourceId;
+
+        return $"Gateway={gateway}; Datasource={datasourceId}; {FormatDatasourceConnection(datasource)}";
+    }
+
+    private static string FormatSemanticModelBindingTarget(
+        PowerBiGateway gateway,
+        PowerBiGatewayDatasource datasource)
+    {
+        if (datasource == null)
+        {
+            return $"Gateway={gateway.Name} ({gateway.Id}); Datasource=first matching datasource selected by Power BI";
+        }
+
+        PowerBiDatasourceConnectionDetails connection = datasource.ParseConnectionDetails();
+        string connectionText = FormatDatasource(connection.Server, connection.Database);
+        return $"Gateway={gateway.Name} ({gateway.Id}); Datasource={datasource.DatasourceName} ({datasource.Id}); {connectionText}";
+    }
+
+    private static string FormatDatasourceConnection(PowerBiDatasource datasource)
+    {
+        PowerBiDatasourceConnectionDetails connection = datasource.ConnectionDetails ??
+            new PowerBiDatasourceConnectionDetails();
+        return $"Type={datasource.DatasourceType}; {FormatDatasource(connection.Server, connection.Database)}";
     }
 
     private async Task<PowerBiDatasourceResponse> GetPaginatedRuntimeDatasourcesAsync(
