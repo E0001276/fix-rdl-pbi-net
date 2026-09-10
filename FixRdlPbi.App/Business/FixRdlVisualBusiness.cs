@@ -234,8 +234,12 @@ public class FixRdlVisualBusiness
                 paginatedDefinition
             );
 
-            paginatedDefinition.Definition.Format = "PaginatedReportDefinition";
-
+            // Do not force the definition format for paginated reports.
+            // Some Fabric tenants currently reject an explicit
+            // PaginatedReportDefinition value with InvalidDefinitionFormat,
+            // even though the public API documentation lists it as supported.
+            // getDefinition without ?format= returns the tenant-native definition,
+            // so preserve that response and omit format when it is null.
             bool rdlDefinitionChanged = UpdatePaginatedReportDefinition(
                 paginatedDefinition,
                 analysis
@@ -243,11 +247,23 @@ public class FixRdlVisualBusiness
 
             if (rdlDefinitionChanged)
             {
+                // Use the generic Fabric Item updateDefinition endpoint for paginated reports.
+                // In this tenant, the type-specific /paginatedReports/.../updateDefinition
+                // endpoint returns InvalidDefinitionFormat even for the documented
+                // PaginatedReportDefinition format. The Core Items API accepts the item
+                // definition as parts[] and does not require an explicit format value.
+                // Preserve the exact RDL part path returned by getDefinition because it is
+                // already the canonical path persisted by Fabric.
+                ReportDefinition updateDefinition = BuildPaginatedUpdateDefinition(
+                    paginatedDefinition,
+                    paginatedReport.DisplayName
+                );
+
                 await UpdateDefinitionAsync(
-                    $"workspaces/{analysis.TargetWorkspace.Id}/paginatedReports/{paginatedReport.Id}/updateDefinition?updateMetadata=false",
+                    $"workspaces/{analysis.TargetWorkspace.Id}/items/{paginatedReport.Id}/updateDefinition",
                     new UpdateDefinitionRequest
                     {
-                        Definition = paginatedDefinition.Definition
+                        Definition = updateDefinition
                     }
                 );
 
@@ -982,6 +998,67 @@ public class FixRdlVisualBusiness
 
         return $"Name={targetDatasourceName}; Workspace={analysis.TargetWorkspace.DisplayName}; " +
                $"Dataset={analysis.TargetSemanticModel.DisplayName}; SemanticModelId={analysis.TargetSemanticModel.Id}";
+    }
+
+
+    private static ReportDefinition BuildPaginatedUpdateDefinition(
+        ReportDefinitionResponse sourceDefinition,
+        string paginatedReportDisplayName)
+    {
+        if (sourceDefinition == null || sourceDefinition.Definition == null)
+        {
+            throw new InvalidOperationException(
+                "The paginated report definition is empty."
+            );
+        }
+
+        List<ReportDefinitionPart> rdlParts = sourceDefinition.Definition.Parts
+            .Where(x => x != null &&
+                !string.IsNullOrWhiteSpace(x.Path) &&
+                x.Path.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (rdlParts.Count != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected exactly one RDL definition part, but found {rdlParts.Count}."
+            );
+        }
+
+        ReportDefinitionPart sourceRdl = rdlParts[0];
+        if (string.IsNullOrWhiteSpace(sourceRdl.Payload))
+        {
+            throw new InvalidOperationException(
+                $"The RDL definition part for '{paginatedReportDisplayName}' has an empty payload."
+            );
+        }
+
+        if (string.IsNullOrWhiteSpace(sourceRdl.Path))
+        {
+            throw new InvalidOperationException(
+                $"The RDL definition part for '{paginatedReportDisplayName}' has an empty path."
+            );
+        }
+
+        return new ReportDefinition
+        {
+            // Intentionally omit format. The generic Core Items updateDefinition API
+            // accepts parts[] directly, and omitting format avoids the tenant-specific
+            // InvalidDefinitionFormat response seen with PaginatedReportDefinition.
+            Format = null,
+            Parts = new List<ReportDefinitionPart>
+            {
+                new ReportDefinitionPart
+                {
+                    // Keep the exact path returned by Fabric getDefinition.
+                    Path = sourceRdl.Path,
+                    Payload = sourceRdl.Payload,
+                    PayloadType = string.IsNullOrWhiteSpace(sourceRdl.PayloadType)
+                        ? "InlineBase64"
+                        : sourceRdl.PayloadType
+                }
+            }
+        };
     }
 
     private static bool UpdatePaginatedReportDefinition(
