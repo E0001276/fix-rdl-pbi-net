@@ -31,3 +31,13 @@ This is intentionally stronger than only replacing GUID strings in the existing 
 Only the target workspace is modified. Before applying changes, the current target definitions are saved under the local `backup` folder.
 
 The project targets `net9.0-windows` and uses `<Nullable>disable</Nullable>`.
+
+## Diagnostic logging for Apply fixes
+
+When Apply fixes runs, the application creates a diagnostic session under:
+
+`<application folder>/diagnostics/yyyyMMdd-HHmmss-<workspace>-<report>/`
+
+For paginated report definition updates it records the definition before and after the in-memory change, decoded RDL XML, Base64 payloads, the exact updateDefinition request, HTTP response headers/body, Fabric long-running operation states, the definition returned during verification, a summary, and the complete exception when a failure occurs.
+
+Authorization tokens and credentials are not written to diagnostic files. If Apply fixes fails, the diagnostics directory is shown in the execution log and error dialog.

@@ -6,6 +6,7 @@ using System.Xml;
 using System.Xml.Linq;
 using FixRdlPbi.App.Clients;
 using FixRdlPbi.App.Models;
+using FixRdlPbi.App.Services;
 
 namespace FixRdlPbi.App.Business;
 
@@ -140,7 +141,19 @@ public class FixRdlVisualBusiness
             throw new ArgumentNullException(nameof(analysis));
         }
 
+        DiagnosticSession diagnostic = new(
+            $"{analysis.TargetWorkspace.DisplayName}-{analysis.TargetReport.DisplayName}"
+        );
+
+        diagnostic.WriteSummaryLine($"Source workspace: {analysis.SourceWorkspace.DisplayName} ({analysis.SourceWorkspace.Id})");
+        diagnostic.WriteSummaryLine($"Target workspace: {analysis.TargetWorkspace.DisplayName} ({analysis.TargetWorkspace.Id})");
+        diagnostic.WriteSummaryLine($"Target report: {analysis.TargetReport.DisplayName} ({analysis.TargetReport.Id})");
+        diagnostic.WriteSummaryLine($"Target semantic model: {analysis.TargetSemanticModel.DisplayName} ({analysis.TargetSemanticModel.Id})");
+
         string backupDirectory = CreateBackupDirectory(analysis);
+
+        try
+        {
 
         ReportDefinitionResponse targetReportDefinition = await GetReportDefinitionAsync(
             analysis.TargetWorkspace.Id,
@@ -228,6 +241,12 @@ public class FixRdlVisualBusiness
                     paginatedReport.Id
                 );
 
+            string diagnosticPrefix = DiagnosticSession.SanitizeFileName(paginatedReport.DisplayName);
+            diagnostic.WriteJson($"{diagnosticPrefix}-definition-before.json", paginatedDefinition);
+            WriteRdlPartsToDiagnostics(diagnostic, diagnosticPrefix, "before", paginatedDefinition);
+            diagnostic.WriteSummaryLine($"Paginated report: {paginatedReport.DisplayName} ({paginatedReport.Id})");
+            diagnostic.WriteSummaryLine($"Expected target semantic model ID: {analysis.TargetSemanticModel.Id}");
+
             await SaveBackupAsync(
                 backupDirectory,
                 $"Paginated-{SanitizeFileName(paginatedReport.DisplayName)}.json",
@@ -245,29 +264,57 @@ public class FixRdlVisualBusiness
                 analysis
             );
 
+            diagnostic.WriteJson($"{diagnosticPrefix}-definition-after.json", paginatedDefinition);
+            WriteRdlPartsToDiagnostics(diagnostic, diagnosticPrefix, "after", paginatedDefinition);
+            diagnostic.WriteSummaryLine($"RDL modified in memory: {(rdlDefinitionChanged ? "Yes" : "No")}");
+
             if (rdlDefinitionChanged)
             {
-                // Use the generic Fabric Item updateDefinition endpoint for paginated reports.
-                // In this tenant, the type-specific /paginatedReports/.../updateDefinition
-                // endpoint returns InvalidDefinitionFormat even for the documented
-                // PaginatedReportDefinition format. The Core Items API accepts the item
-                // definition as parts[] and does not require an explicit format value.
-                // Preserve the exact RDL part path returned by getDefinition because it is
-                // already the canonical path persisted by Fabric.
+                // Use the type-specific Paginated Report updateDefinition endpoint.
+                // Microsoft documents this endpoint for overriding a paginated report
+                // definition. In this tenant, sending the explicit
+                // PaginatedReportDefinition format causes InvalidDefinitionFormat, while
+                // getDefinition succeeds when the format is omitted. Therefore build the
+                // smallest valid definition: one RDL part, no .platform part, and omit the
+                // optional format property. The RDL path must exactly match the report
+                // display name.
                 ReportDefinition updateDefinition = BuildPaginatedUpdateDefinition(
                     paginatedDefinition,
                     paginatedReport.DisplayName
                 );
 
-                await UpdateDefinitionAsync(
-                    $"workspaces/{analysis.TargetWorkspace.Id}/items/{paginatedReport.Id}/updateDefinition",
-                    new UpdateDefinitionRequest
-                    {
-                        Definition = updateDefinition
-                    }
+                UpdateDefinitionRequest updateRequest = new()
+                {
+                    Definition = updateDefinition
+                };
+
+                string updateEndpoint =
+                    $"workspaces/{analysis.TargetWorkspace.Id}/paginatedReports/{paginatedReport.Id}/updateDefinition";
+
+                diagnostic.WriteSummaryLine($"UpdateDefinition endpoint: {updateEndpoint}");
+                diagnostic.WriteJson($"{diagnosticPrefix}-update-request.json", updateRequest);
+                WriteDecodedUpdateRequestDiagnostic(
+                    diagnostic,
+                    diagnosticPrefix,
+                    updateEndpoint,
+                    updateRequest
                 );
 
-                await VerifyPaginatedReportDefinitionAsync(analysis, paginatedReport);
+                await UpdateDefinitionAsync(
+                    updateEndpoint,
+                    updateRequest,
+                    diagnostic,
+                    diagnosticPrefix
+                );
+
+                WriteFabricAuthenticationDiagnostics(
+                    diagnostic,
+                    diagnosticPrefix,
+                    updateEndpoint,
+                    updateRequest
+                );
+
+                await VerifyPaginatedReportDefinitionAsync(analysis, paginatedReport, diagnostic, diagnosticPrefix);
                 paginatedDefinitionChanged++;
                 paginatedReportChanged = true;
             }
@@ -347,11 +394,22 @@ public class FixRdlVisualBusiness
             }
         }
 
+        diagnostic.WriteSummaryLine("Apply fixes completed successfully.");
+
         return $"Completed. Power BI report updated: {(reportChanged ? "Yes" : "No")}. " +
                $"Semantic model gateway updated: {(semanticModelGatewayChanged ? "Yes" : "No")}. " +
                $"Paginated RDL definitions updated: {paginatedDefinitionChanged}. " +
                $"Paginated runtime datasources updated: {paginatedRuntimeChanged}. " +
-               $"Paginated reports changed: {paginatedChanged}. Backup: {backupDirectory}";
+               $"Paginated reports changed: {paginatedChanged}. Backup: {backupDirectory}. " +
+               $"Diagnostics: {diagnostic.DirectoryPath}";
+        }
+        catch (Exception ex)
+        {
+            diagnostic.WriteSummaryLine($"FAILED: {ex.GetType().FullName}: {ex.Message}");
+            diagnostic.WriteText("exception.txt", ex.ToString());
+            ex.Data["DiagnosticDirectory"] = diagnostic.DirectoryPath;
+            throw;
+        }
     }
 
     private void BuildPaginatedMappings(FixRdlAnalysis analysis)
@@ -910,38 +968,79 @@ public class FixRdlVisualBusiness
 
     private async Task VerifyPaginatedReportDefinitionAsync(
         FixRdlAnalysis analysis,
-        PaginatedReport paginatedReport)
+        PaginatedReport paginatedReport,
+        DiagnosticSession diagnostic,
+        string diagnosticPrefix)
     {
-        PaginatedReportInspectionResult persisted =
-            await _paginatedReportDefinitionBusiness.GetInspectionAsync(
-                analysis.TargetWorkspace.Id,
-                paginatedReport.Id
+        const int maxAttempts = 5;
+        const int delaySeconds = 2;
+        List<PaginatedDataSource> lastInvalid = new();
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            ReportDefinitionResponse persistedDefinition =
+                await _paginatedReportDefinitionBusiness.GetDefinitionAsync(
+                    analysis.TargetWorkspace.Id,
+                    paginatedReport.Id
+                );
+
+            diagnostic.WriteJson(
+                $"{diagnosticPrefix}-verification-definition-attempt-{attempt}.json",
+                persistedDefinition
+            );
+            WriteRdlPartsToDiagnostics(
+                diagnostic,
+                diagnosticPrefix,
+                $"verification-attempt-{attempt}",
+                persistedDefinition
             );
 
-        if (persisted.DataSources.Count == 0)
-        {
-            throw new InvalidOperationException(
-                $"Fabric accepted the paginated report update, but '{paginatedReport.DisplayName}' " +
-                "does not contain an embedded RDL data source after the update."
+            PaginatedReportInspectionResult persisted =
+                new PaginatedReportInspectionResult
+                {
+                    DataSources = PaginatedReportDefinitionBusiness.GetDataSources(persistedDefinition)
+                };
+
+            if (persisted.DataSources.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Fabric accepted the paginated report update, but '{paginatedReport.DisplayName}' " +
+                    "does not contain an embedded RDL data source after the update."
+                );
+            }
+
+            lastInvalid = persisted.DataSources
+                .Where(x => !IsTargetRdlDefinition(x, analysis))
+                .ToList();
+
+            if (lastInvalid.Count == 0)
+            {
+                diagnostic.WriteSummaryLine(
+                    $"Paginated report definition verification succeeded on attempt {attempt}."
+                );
+                return;
+            }
+
+            diagnostic.WriteSummaryLine(
+                $"Paginated report definition verification attempt {attempt}/{maxAttempts} still returned the previous semantic model reference."
             );
+
+            if (attempt < maxAttempts)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+            }
         }
 
-        List<PaginatedDataSource> invalid = persisted.DataSources
-            .Where(x => !IsTargetRdlDefinition(x, analysis))
-            .ToList();
+        string details = string.Join(
+            " | ",
+            lastInvalid.Select(FormatRdlDefinitionCurrent)
+        );
 
-        if (invalid.Count > 0)
-        {
-            string details = string.Join(
-                " | ",
-                invalid.Select(FormatRdlDefinitionCurrent)
-            );
-
-            throw new InvalidOperationException(
-                $"Fabric accepted the paginated report definition update, but '{paginatedReport.DisplayName}' " +
-                $"was not persisted with the expected QA semantic model reference. Found: {details}"
-            );
-        }
+        throw new InvalidOperationException(
+            $"Fabric accepted the paginated report definition update, but '{paginatedReport.DisplayName}' " +
+            $"was not persisted with the expected target semantic model reference after {maxAttempts} verification attempts. " +
+            $"Expected SemanticModelId={analysis.TargetSemanticModel.Id}. Found: {details}"
+        );
     }
 
     private static bool IsTargetRdlDefinition(
@@ -1040,22 +1139,23 @@ public class FixRdlVisualBusiness
             );
         }
 
+        string expectedPath = paginatedReportDisplayName + ".rdl";
+
         return new ReportDefinition
         {
-            // Intentionally omit format. The generic Core Items updateDefinition API
-            // accepts parts[] directly, and omitting format avoids the tenant-specific
-            // InvalidDefinitionFormat response seen with PaginatedReportDefinition.
+            // PaginatedReportDefinition is the documented format, but the target tenant
+            // rejects the explicit value. The format field is optional in the serialized
+            // request model, so omit it and let Fabric use the paginated report default.
             Format = null,
             Parts = new List<ReportDefinitionPart>
             {
                 new ReportDefinitionPart
                 {
-                    // Keep the exact path returned by Fabric getDefinition.
-                    Path = sourceRdl.Path,
+                    // Microsoft requires the RDL path to match the paginated report
+                    // display name exactly.
+                    Path = expectedPath,
                     Payload = sourceRdl.Payload,
-                    PayloadType = string.IsNullOrWhiteSpace(sourceRdl.PayloadType)
-                        ? "InlineBase64"
-                        : sourceRdl.PayloadType
+                    PayloadType = "InlineBase64"
                 }
             }
         };
@@ -1517,9 +1617,26 @@ public class FixRdlVisualBusiness
         );
     }
 
-    private async Task UpdateDefinitionAsync<TRequest>(string endpoint, TRequest request)
+    private async Task UpdateDefinitionAsync<TRequest>(
+        string endpoint,
+        TRequest request,
+        DiagnosticSession diagnostic = null,
+        string diagnosticPrefix = null)
     {
         using HttpResponseMessage response = await _fabricApiClient.PostResponseAsync(endpoint, request);
+        string responseBody = await response.Content.ReadAsStringAsync();
+
+        if (diagnostic != null)
+        {
+            string prefix = string.IsNullOrWhiteSpace(diagnosticPrefix) ? "update-definition" : diagnosticPrefix;
+            diagnostic.WriteText(
+                $"{prefix}-update-response.txt",
+                BuildHttpResponseDiagnostic(response, responseBody)
+            );
+            diagnostic.WriteSummaryLine(
+                $"UpdateDefinition HTTP status: {(int)response.StatusCode} {response.StatusCode}"
+            );
+        }
 
         if (response.StatusCode == System.Net.HttpStatusCode.OK)
         {
@@ -1529,17 +1646,21 @@ public class FixRdlVisualBusiness
         if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
         {
             string operationId = GetOperationId(response);
-            await WaitForOperationAsync(operationId, GetRetryAfter(response));
+            diagnostic?.WriteSummaryLine($"Fabric operation ID: {operationId}");
+            await WaitForOperationAsync(operationId, GetRetryAfter(response), diagnostic, diagnosticPrefix);
             return;
         }
 
-        string error = await response.Content.ReadAsStringAsync();
         throw new HttpRequestException(
-            $"Error updating item definition. HTTP {(int)response.StatusCode}: {error}"
+            $"Error updating item definition. HTTP {(int)response.StatusCode}: {responseBody}"
         );
     }
 
-    private async Task WaitForOperationAsync(string operationId, int retryAfter)
+    private async Task WaitForOperationAsync(
+        string operationId,
+        int retryAfter,
+        DiagnosticSession diagnostic = null,
+        string diagnosticPrefix = null)
     {
         while (true)
         {
@@ -1548,6 +1669,13 @@ public class FixRdlVisualBusiness
             FabricOperation operation = await _fabricApiClient.GetAsync<FabricOperation>(
                 $"operations/{operationId}"
             );
+
+            if (diagnostic != null)
+            {
+                string prefix = string.IsNullOrWhiteSpace(diagnosticPrefix) ? "fabric-operation" : diagnosticPrefix;
+                diagnostic.WriteJson($"{prefix}-operation-{DateTime.Now:HHmmssfff}.json", operation);
+                diagnostic.WriteSummaryLine($"Fabric operation {operationId} status: {operation?.Status ?? "(null)"}");
+            }
 
             if (operation == null)
             {
@@ -1600,6 +1728,197 @@ public class FixRdlVisualBusiness
         }
 
         return 2;
+    }
+
+    private static void WriteRdlPartsToDiagnostics(
+        DiagnosticSession diagnostic,
+        string prefix,
+        string stage,
+        ReportDefinitionResponse definition)
+    {
+        if (diagnostic == null || definition?.Definition?.Parts == null)
+        {
+            return;
+        }
+
+        int index = 0;
+
+        foreach (ReportDefinitionPart part in definition.Definition.Parts)
+        {
+            if (part == null ||
+                string.IsNullOrWhiteSpace(part.Path) ||
+                !part.Path.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(part.Payload))
+            {
+                continue;
+            }
+
+            index++;
+            string xml;
+
+            try
+            {
+                xml = Encoding.UTF8.GetString(Convert.FromBase64String(part.Payload));
+            }
+            catch (Exception ex)
+            {
+                xml = $"Could not decode RDL payload. {ex}";
+            }
+
+            diagnostic.WriteText($"{prefix}-{stage}-rdl-{index}.xml", xml);
+            diagnostic.WriteText($"{prefix}-{stage}-rdl-{index}.base64.txt", part.Payload);
+            diagnostic.WriteSummaryLine($"{stage} RDL part path: {part.Path}; PayloadType={part.PayloadType}; Base64Length={part.Payload.Length}");
+        }
+    }
+
+    private static void WriteDecodedUpdateRequestDiagnostic(
+        DiagnosticSession diagnostic,
+        string prefix,
+        string endpoint,
+        UpdateDefinitionRequest request)
+    {
+        if (diagnostic == null || request?.Definition?.Parts == null)
+        {
+            return;
+        }
+
+        StringBuilder builder = new();
+        builder.AppendLine("FABRIC UPDATE DEFINITION REQUEST - DECODED");
+        builder.AppendLine("==========================================");
+        builder.AppendLine();
+        builder.AppendLine("Method: POST");
+        builder.AppendLine($"URL: https://api.fabric.microsoft.com/v1/{endpoint}");
+        builder.AppendLine($"Definition format: {request.Definition.Format ?? "(omitted)"}");
+        builder.AppendLine($"Parts: {request.Definition.Parts.Count}");
+        builder.AppendLine();
+
+        int index = 0;
+        foreach (ReportDefinitionPart part in request.Definition.Parts)
+        {
+            index++;
+            builder.AppendLine($"PART {index}");
+            builder.AppendLine("------");
+            builder.AppendLine($"Path: {part?.Path ?? string.Empty}");
+            builder.AppendLine($"PayloadType: {part?.PayloadType ?? string.Empty}");
+            builder.AppendLine($"Base64Length: {part?.Payload?.Length ?? 0}");
+            builder.AppendLine();
+            builder.AppendLine("Decoded payload:");
+            builder.AppendLine();
+
+            if (part == null || string.IsNullOrWhiteSpace(part.Payload))
+            {
+                builder.AppendLine("(empty payload)");
+            }
+            else
+            {
+                try
+                {
+                    byte[] bytes = Convert.FromBase64String(part.Payload);
+                    builder.AppendLine(Encoding.UTF8.GetString(bytes));
+                }
+                catch (Exception ex)
+                {
+                    builder.AppendLine($"Could not decode payload: {ex}");
+                }
+            }
+
+            builder.AppendLine();
+        }
+
+        diagnostic.WriteText($"{prefix}-update-request-decoded.txt", builder.ToString());
+    }
+
+    private void WriteFabricAuthenticationDiagnostics(
+        DiagnosticSession diagnostic,
+        string prefix,
+        string endpoint,
+        UpdateDefinitionRequest request)
+    {
+        if (diagnostic == null)
+        {
+            return;
+        }
+
+        string token = _fabricApiClient.LastAccessToken ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            diagnostic.WriteSummaryLine("WARNING: Fabric access token was not available for diagnostic export.");
+            return;
+        }
+
+        diagnostic.WriteText(
+            $"{prefix}-fabric-access-token.txt",
+            "SENSITIVE FILE - DO NOT COMMIT OR SHARE PUBLICLY" + Environment.NewLine +
+            "This file contains the Fabric bearer token used by the updateDefinition request." + Environment.NewLine +
+            "Access tokens expire. Generate a new diagnostic run if the token has expired." + Environment.NewLine +
+            Environment.NewLine +
+            token + Environment.NewLine
+        );
+
+        string requestFileName = $"{prefix}-update-request.json";
+        string absoluteRequestPath = Path.Combine(diagnostic.DirectoryPath, requestFileName);
+        string url = $"https://api.fabric.microsoft.com/v1/{endpoint}";
+
+        StringBuilder curl = new();
+        curl.AppendLine("SENSITIVE FILE - DO NOT COMMIT OR SHARE PUBLICLY");
+        curl.AppendLine("The command below replays the exact updateDefinition request using the saved JSON payload.");
+        curl.AppendLine("Run it before the access token expires.");
+        curl.AppendLine();
+        curl.AppendLine("curl.exe --request POST ^");
+        curl.AppendLine($"  --url \"{url}\" ^");
+        curl.AppendLine($"  --header \"Authorization: Bearer {token}\" ^");
+        curl.AppendLine("  --header \"Content-Type: application/json\" ^");
+        curl.AppendLine($"  --data-binary \"@{absoluteRequestPath}\"");
+        curl.AppendLine();
+        curl.AppendLine("Postman manual equivalent:");
+        curl.AppendLine($"URL: {url}");
+        curl.AppendLine("Method: POST");
+        curl.AppendLine("Authorization type: Bearer Token");
+        curl.AppendLine($"Token: {token}");
+        curl.AppendLine($"Body: raw JSON from {absoluteRequestPath}");
+        curl.AppendLine("Content-Type: application/json");
+
+        diagnostic.WriteText($"{prefix}-curl.txt", curl.ToString());
+
+        diagnostic.WriteText(
+            "SECURITY-WARNING.txt",
+            "IMPORTANT: This diagnostic folder can contain active bearer tokens and complete API replay commands." + Environment.NewLine +
+            "Do not commit it to Git, upload it to shared storage, or send it to third parties while the token is valid." + Environment.NewLine +
+            "Delete the diagnostic folder when troubleshooting is complete. Tokens are short-lived but must still be treated as credentials." + Environment.NewLine
+        );
+
+        diagnostic.WriteSummaryLine($"Sensitive Fabric token saved to: {prefix}-fabric-access-token.txt");
+        diagnostic.WriteSummaryLine($"Replay cURL command saved to: {prefix}-curl.txt");
+    }
+
+    private static string BuildHttpResponseDiagnostic(
+        HttpResponseMessage response,
+        string responseBody)
+    {
+        StringBuilder builder = new();
+        builder.AppendLine($"Status: {(int)response.StatusCode} {response.StatusCode}");
+        builder.AppendLine("Headers:");
+
+        foreach (KeyValuePair<string, IEnumerable<string>> header in response.Headers)
+        {
+            if (string.Equals(header.Key, "Authorization", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            builder.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
+        }
+
+        foreach (KeyValuePair<string, IEnumerable<string>> header in response.Content.Headers)
+        {
+            builder.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("Body:");
+        builder.AppendLine(responseBody ?? string.Empty);
+
+        return builder.ToString();
     }
 
     private static T FindUniqueByName<T>(

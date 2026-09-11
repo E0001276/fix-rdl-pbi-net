@@ -140,7 +140,7 @@ public class PaginatedReportDefinitionBusiness
         return result;
     }
 
-    private static List<PaginatedDataSource> GetDataSources(
+    public static List<PaginatedDataSource> GetDataSources(
         ReportDefinitionResponse definition)
     {
         ReportDefinitionPart rdlPart = definition.Definition.Parts

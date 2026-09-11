@@ -12,6 +12,8 @@ public class FabricApiClient
     private readonly HttpClient _httpClient;
     private readonly FabricTokenProvider _tokenProvider;
 
+    public string LastAccessToken { get; private set; } = string.Empty;
+
     private readonly JsonSerializerOptions _jsonOptions =
         new()
         {
@@ -30,6 +32,7 @@ public class FabricApiClient
     private async Task PrepareRequestAsync()
     {
         string token = await _tokenProvider.GetAccessTokenAsync();
+        LastAccessToken = token;
 
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
     }

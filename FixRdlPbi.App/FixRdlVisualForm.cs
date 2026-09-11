@@ -262,8 +262,22 @@ public partial class FixRdlVisualForm : Form
             lblStatus.Text = "Error.";
             AppendLog(ex.ToString());
 
+            string diagnosticDirectory = ex.Data["DiagnosticDirectory"] as string;
+
+            if (!string.IsNullOrWhiteSpace(diagnosticDirectory))
+            {
+                AppendLog($"Diagnostic files: {diagnosticDirectory}");
+            }
+
+            string message = ex.Message;
+
+            if (!string.IsNullOrWhiteSpace(diagnosticDirectory))
+            {
+                message += $"\r\n\r\nDiagnostic files:\r\n{diagnosticDirectory}";
+            }
+
             MessageBox.Show(
-                ex.Message,
+                message,
                 "Fix RDL Visual - Error",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error
