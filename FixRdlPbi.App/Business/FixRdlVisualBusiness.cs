@@ -228,13 +228,12 @@ public class FixRdlVisualBusiness
         foreach (PaginatedReport paginatedReport in analysis.TargetPaginatedReports)
         {
             bool paginatedReportChanged = false;
-            string targetServer = BuildPowerBiServer(analysis.TargetWorkspace.DisplayName);
-            string targetDatabase = analysis.TargetSemanticModel.DisplayName;
+            string targetDatabase = BuildPaginatedSemanticModelDatabase(analysis.TargetSemanticModel.Id);
 
             // First fix the physical RDL definition. UpdateDatasources only changes the
             // runtime connection in Power BI Service; it does not rewrite the RDL that
             // Report Builder downloads. Keeping the RDL itself correct is required so
-            // rd:PowerBIWorkspaceName and the virtual server semantic-model ID point to QA.
+            // rd:PowerBIWorkspaceName and rd:PowerBIDatasetName point to the target environment.
             ReportDefinitionResponse paginatedDefinition =
                 await _paginatedReportDefinitionBusiness.GetDefinitionAsync(
                     analysis.TargetWorkspace.Id,
@@ -259,10 +258,31 @@ public class FixRdlVisualBusiness
             // even though the public API documentation lists it as supported.
             // getDefinition without ?format= returns the tenant-native definition,
             // so preserve that response and omit format when it is null.
-            bool rdlDefinitionChanged = UpdatePaginatedReportDefinition(
+            PaginatedReportInspectionResult currentRdlInspection = new()
+            {
+                DataSources = PaginatedReportDefinitionBusiness.GetDataSources(paginatedDefinition)
+            };
+
+            bool logicalRdlBindingCorrect = currentRdlInspection.DataSources.Count > 0 &&
+                currentRdlInspection.DataSources.All(x => IsTargetRdlLogicalDefinition(x, analysis));
+
+            // Fabric can keep legacy/internal PBIDATASET connection metadata in the public/downloaded
+            // RDL even when the logical Power BI workspace + semantic model association is correct.
+            // Microsoft also documents that downloaded RDL can lag the latest state visible in the
+            // service. Do not repeatedly rewrite the RDL just because the internal virtual-server GUID
+            // differs; repair the RDL only when its logical workspace/dataset binding is wrong.
+            bool rdlDefinitionChanged = !logicalRdlBindingCorrect && UpdatePaginatedReportDefinition(
                 paginatedDefinition,
                 analysis
             );
+
+            if (logicalRdlBindingCorrect)
+            {
+                diagnostic.WriteSummaryLine(
+                    "RDL logical binding is already correct (workspace + semantic model name). " +
+                    "Any legacy virtual-server semantic-model GUID is treated as diagnostic metadata only."
+                );
+            }
 
             diagnostic.WriteJson($"{diagnosticPrefix}-definition-after.json", paginatedDefinition);
             WriteRdlPartsToDiagnostics(diagnostic, diagnosticPrefix, "after", paginatedDefinition);
@@ -327,7 +347,13 @@ public class FixRdlVisualBusiness
 
             bool runtimeAlreadyCorrect = runtimeDatasources.Value.Count > 0 &&
                 runtimeDatasources.Value.All(x =>
-                    IsTargetDatasource(x, targetServer, targetDatabase));
+                {
+                    string currentServer = x.ConnectionDetails?.Server ?? string.Empty;
+                    string expectedServer = string.IsNullOrWhiteSpace(currentServer)
+                        ? "pbiazure://api.powerbi.com/"
+                        : currentServer;
+                    return IsTargetDatasource(x, expectedServer, targetDatabase);
+                });
 
             if (!runtimeAlreadyCorrect)
             {
@@ -350,11 +376,22 @@ public class FixRdlVisualBusiness
                         );
                     }
 
+                    PowerBiDatasource runtimeDataSource = runtimeDatasources.Value.FirstOrDefault(x =>
+                        string.Equals(x.Name, dataSource.Name, StringComparison.OrdinalIgnoreCase))
+                        ?? runtimeDatasources.Value.FirstOrDefault();
+
+                    string currentServer = runtimeDataSource?.ConnectionDetails?.Server ?? string.Empty;
+                    string targetServer = string.IsNullOrWhiteSpace(currentServer)
+                        ? "pbiazure://api.powerbi.com/"
+                        : currentServer;
+
                     updateDetails.Add(new UpdateRdlDatasourceDetail
                     {
                         DatasourceName = dataSource.Name,
                         ConnectionDetails = new RdlDatasourceConnectionDetails
                         {
+                            // Fabric lifecycle guidance for paginated reports says to keep the
+                            // existing server and replace only the virtual database dataset ID.
                             Server = targetServer,
                             Database = targetDatabase
                         }
@@ -384,6 +421,38 @@ public class FixRdlVisualBusiness
                     request
                 );
 
+                PowerBiDatasourceResponse persistedRuntimeDatasources =
+                    await GetPaginatedRuntimeDatasourcesAsync(
+                        analysis.TargetWorkspace.Id,
+                        paginatedReport.Id
+                    );
+
+                bool runtimePersisted = persistedRuntimeDatasources.Value.Count > 0 &&
+                    persistedRuntimeDatasources.Value.All(x =>
+                    {
+                        string persistedServer = x.ConnectionDetails?.Server ?? string.Empty;
+                        string expectedServer = string.IsNullOrWhiteSpace(persistedServer)
+                            ? "pbiazure://api.powerbi.com/"
+                            : persistedServer;
+                        return IsTargetDatasource(x, expectedServer, targetDatabase);
+                    });
+
+                if (!runtimePersisted)
+                {
+                    string persistedDetails = string.Join(
+                        " | ",
+                        persistedRuntimeDatasources.Value.Select(x => FormatDatasource(
+                            x.ConnectionDetails?.Server ?? string.Empty,
+                            x.ConnectionDetails?.Database ?? string.Empty))
+                    );
+
+                    throw new InvalidOperationException(
+                        $"Power BI accepted the paginated runtime datasource update for '{paginatedReport.DisplayName}', " +
+                        $"but the target semantic-model database was not persisted. Expected Database={targetDatabase}. " +
+                        $"Found: {persistedDetails}"
+                    );
+                }
+
                 paginatedRuntimeChanged++;
                 paginatedReportChanged = true;
             }
@@ -394,13 +463,31 @@ public class FixRdlVisualBusiness
             }
         }
 
+        // Refresh the target semantic model after all bindings and datasource changes are complete.
+        // This mirrors the Power BI Service "Refresh now" action. The refresh endpoint returns
+        // 202 Accepted and a refresh identifier; wait for the refresh execution to complete so
+        // Apply fixes does not report success while the semantic model is still processing.
+        diagnostic.WriteSummaryLine(
+            $"Starting semantic model refresh: {analysis.TargetSemanticModel.DisplayName} ({analysis.TargetSemanticModel.Id})."
+        );
+
+        string refreshId = await _powerBiApiClient.RefreshDatasetAndWaitAsync(
+            analysis.TargetWorkspace.Id,
+            analysis.TargetSemanticModel.Id,
+            message => diagnostic.WriteSummaryLine(message)
+        );
+
+        diagnostic.WriteSummaryLine(
+            $"Semantic model refresh completed successfully. RefreshId={refreshId}."
+        );
         diagnostic.WriteSummaryLine("Apply fixes completed successfully.");
 
         return $"Completed. Power BI report updated: {(reportChanged ? "Yes" : "No")}. " +
                $"Semantic model gateway updated: {(semanticModelGatewayChanged ? "Yes" : "No")}. " +
                $"Paginated RDL definitions updated: {paginatedDefinitionChanged}. " +
                $"Paginated runtime datasources updated: {paginatedRuntimeChanged}. " +
-               $"Paginated reports changed: {paginatedChanged}. Backup: {backupDirectory}. " +
+               $"Paginated reports changed: {paginatedChanged}. " +
+               $"Semantic model refreshed: Yes (RefreshId={refreshId}). Backup: {backupDirectory}. " +
                $"Diagnostics: {diagnostic.DirectoryPath}";
         }
         catch (Exception ex)
@@ -535,8 +622,7 @@ public class FixRdlVisualBusiness
 
         foreach (PaginatedReport paginatedReport in analysis.TargetPaginatedReports)
         {
-            string targetServer = BuildPowerBiServer(analysis.TargetWorkspace.DisplayName);
-            string targetDatabase = analysis.TargetSemanticModel.DisplayName;
+            string targetDatabase = BuildPaginatedSemanticModelDatabase(analysis.TargetSemanticModel.Id);
 
             PaginatedReportInspectionResult rdlInspection =
                 await _paginatedReportDefinitionBusiness.GetInspectionAsync(
@@ -567,7 +653,7 @@ public class FixRdlVisualBusiness
                         Property = "RDL definition",
                         CurrentValue = FormatRdlDefinitionCurrent(dataSource),
                         TargetValue = FormatRdlDefinitionTarget(analysis, dataSource.Name),
-                        Status = IsTargetRdlDefinition(dataSource, analysis)
+                        Status = IsTargetRdlLogicalDefinition(dataSource, analysis)
                             ? "Correct"
                             : "Needs fix"
                     });
@@ -588,7 +674,7 @@ public class FixRdlVisualBusiness
                     ArtifactName = paginatedReport.DisplayName,
                     Property = "Runtime data source",
                     CurrentValue = "No data source returned by Power BI API",
-                    TargetValue = FormatDatasource(targetServer, targetDatabase),
+                    TargetValue = FormatDatasource("Keep existing server", targetDatabase),
                     Status = "Error"
                 });
                 continue;
@@ -598,6 +684,10 @@ public class FixRdlVisualBusiness
             {
                 string currentServer = dataSource.ConnectionDetails?.Server ?? string.Empty;
                 string currentDatabase = dataSource.ConnectionDetails?.Database ?? string.Empty;
+
+                string targetServer = string.IsNullOrWhiteSpace(currentServer)
+                    ? "pbiazure://api.powerbi.com/"
+                    : currentServer;
 
                 analysis.Rows.Add(new FixRdlPlanRow
                 {
@@ -1010,7 +1100,7 @@ public class FixRdlVisualBusiness
             }
 
             lastInvalid = persisted.DataSources
-                .Where(x => !IsTargetRdlDefinition(x, analysis))
+                .Where(x => !IsTargetRdlLogicalDefinition(x, analysis))
                 .ToList();
 
             if (lastInvalid.Count == 0)
@@ -1022,7 +1112,7 @@ public class FixRdlVisualBusiness
             }
 
             diagnostic.WriteSummaryLine(
-                $"Paginated report definition verification attempt {attempt}/{maxAttempts} still returned the previous semantic model reference."
+                $"Paginated report definition verification attempt {attempt}/{maxAttempts} still returned a different logical workspace/dataset binding."
             );
 
             if (attempt < maxAttempts)
@@ -1038,12 +1128,12 @@ public class FixRdlVisualBusiness
 
         throw new InvalidOperationException(
             $"Fabric accepted the paginated report definition update, but '{paginatedReport.DisplayName}' " +
-            $"was not persisted with the expected target semantic model reference after {maxAttempts} verification attempts. " +
-            $"Expected SemanticModelId={analysis.TargetSemanticModel.Id}. Found: {details}"
+            $"was not persisted with the expected target logical workspace/dataset binding after {maxAttempts} verification attempts. " +
+            $"Expected Workspace={analysis.TargetWorkspace.DisplayName}; Dataset={analysis.TargetSemanticModel.DisplayName}. Found: {details}"
         );
     }
 
-    private static bool IsTargetRdlDefinition(
+    private static bool IsTargetRdlLogicalDefinition(
         PaginatedDataSource dataSource,
         FixRdlAnalysis analysis)
     {
@@ -1058,8 +1148,6 @@ public class FixRdlVisualBusiness
             analysis.TargetWorkspace
         );
 
-        string semanticModelId = ExtractSemanticModelId(dataSource.ConnectionString);
-
         return string.Equals(
                 dataSource.Name,
                 targetDatasourceName,
@@ -1071,10 +1159,6 @@ public class FixRdlVisualBusiness
             string.Equals(
                 dataSource.PowerBIDatasetName,
                 analysis.TargetSemanticModel.DisplayName,
-                StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(
-                semanticModelId,
-                analysis.TargetSemanticModel.Id,
                 StringComparison.OrdinalIgnoreCase);
     }
 
@@ -1096,7 +1180,7 @@ public class FixRdlVisualBusiness
         );
 
         return $"Name={targetDatasourceName}; Workspace={analysis.TargetWorkspace.DisplayName}; " +
-               $"Dataset={analysis.TargetSemanticModel.DisplayName}; SemanticModelId={analysis.TargetSemanticModel.Id}";
+               $"Dataset={analysis.TargetSemanticModel.DisplayName}; RuntimeDatabase={BuildPaginatedSemanticModelDatabase(analysis.TargetSemanticModel.Id)}";
     }
 
 
@@ -1521,9 +1605,9 @@ public class FixRdlVisualBusiness
         );
     }
 
-    private static string BuildPowerBiServer(string workspaceName)
+    private static string BuildPaginatedSemanticModelDatabase(string semanticModelId)
     {
-        return $"powerbi://api.powerbi.com/v1.0/myorg/{workspaceName}";
+        return $"sobe_wowvirtualserver-{semanticModelId}";
     }
 
     private static bool IsTargetDatasource(
