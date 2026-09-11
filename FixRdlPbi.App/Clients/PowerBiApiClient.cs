@@ -90,6 +90,37 @@ public class PowerBiApiClient
         Action<string> progress = null,
         CancellationToken cancellationToken = default)
     {
+        PowerBiDatasetInfo dataset = await GetDatasetInfoAsync(workspaceId, datasetId, cancellationToken);
+
+        progress?.Invoke(
+            $"Target semantic model resolved by Power BI REST API: {dataset.Name} ({dataset.Id}); " +
+            $"IsRefreshable={dataset.IsRefreshable}."
+        );
+
+        if (!dataset.IsRefreshable)
+        {
+            throw new InvalidOperationException(
+                $"The target semantic model '{dataset.Name}' ({dataset.Id}) is not refreshable according to Power BI REST API."
+            );
+        }
+
+        // Snapshot recent refresh request IDs before starting a new refresh. This allows us to
+        // correlate the new refresh even when a redirected 202 response does not preserve the
+        // Location/x-ms-request-id headers on the final HttpResponseMessage.
+        DatasetRefreshHistoryResponse historyBefore = await GetRefreshHistoryAsync(
+            workspaceId,
+            datasetId,
+            10,
+            cancellationToken
+        );
+
+        HashSet<string> knownRequestIds = historyBefore.Value
+            .Where(x => !string.IsNullOrWhiteSpace(x.RequestId))
+            .Select(x => x.RequestId)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        DateTimeOffset requestStartedUtc = DateTimeOffset.UtcNow;
+
         await PrepareRequestAsync();
 
         string endpoint = $"groups/{workspaceId}/datasets/{datasetId}/refreshes";
@@ -103,41 +134,43 @@ public class PowerBiApiClient
         if (!response.IsSuccessStatusCode)
         {
             throw new HttpRequestException(
-                $"Power BI dataset refresh failed to start. HTTP {(int)response.StatusCode}: {responseContent}"
+                $"Power BI semantic model refresh failed to start. HTTP {(int)response.StatusCode}: {responseContent}"
             );
         }
 
-        string refreshId = null;
+        progress?.Invoke(
+            $"Power BI accepted the semantic model refresh. HTTP {(int)response.StatusCode} {response.StatusCode}."
+        );
 
-        if (response.Headers.Location != null)
+        string refreshId = TryGetRefreshIdFromResponse(response);
+
+        if (!string.IsNullOrWhiteSpace(refreshId))
         {
-            string location = response.Headers.Location.ToString().TrimEnd('/');
-            int slashIndex = location.LastIndexOf('/');
-            if (slashIndex >= 0 && slashIndex < location.Length - 1)
-            {
-                refreshId = location[(slashIndex + 1)..];
-            }
+            progress?.Invoke($"Refresh requestId obtained from response headers: {refreshId}.");
         }
-
-        if (string.IsNullOrWhiteSpace(refreshId) &&
-            response.Headers.TryGetValues("x-ms-request-id", out IEnumerable<string> requestIds))
+        else
         {
-            refreshId = requestIds.FirstOrDefault();
-        }
+            progress?.Invoke(
+                "The refresh response did not expose Location/x-ms-request-id. " +
+                "Resolving the new requestId from refresh history."
+            );
 
-        if (string.IsNullOrWhiteSpace(refreshId))
-        {
-            throw new InvalidOperationException(
-                "Power BI accepted the semantic model refresh, but did not return a refresh identifier."
+            refreshId = await ResolveRefreshIdFromHistoryAsync(
+                workspaceId,
+                datasetId,
+                knownRequestIds,
+                requestStartedUtc,
+                progress,
+                cancellationToken
             );
         }
 
-        progress?.Invoke($"Semantic model refresh started. RefreshId={refreshId}.");
+        progress?.Invoke($"Semantic model refresh started. requestId={refreshId}.");
 
         string detailEndpoint = $"groups/{workspaceId}/datasets/{datasetId}/refreshes/{refreshId}";
-        DateTime deadline = DateTime.UtcNow.AddMinutes(30);
+        DateTimeOffset deadline = DateTimeOffset.UtcNow.AddMinutes(30);
 
-        while (DateTime.UtcNow < deadline)
+        while (DateTimeOffset.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
             await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
@@ -146,13 +179,8 @@ public class PowerBiApiClient
             using HttpResponseMessage detailResponse = await _httpClient.GetAsync(detailEndpoint, cancellationToken);
             string detailContent = await detailResponse.Content.ReadAsStringAsync(cancellationToken);
 
-            if (detailResponse.StatusCode == System.Net.HttpStatusCode.Accepted)
-            {
-                progress?.Invoke($"Semantic model refresh {refreshId} is still running.");
-                continue;
-            }
-
-            if (!detailResponse.IsSuccessStatusCode)
+            if (!detailResponse.IsSuccessStatusCode &&
+                detailResponse.StatusCode != System.Net.HttpStatusCode.Accepted)
             {
                 throw new HttpRequestException(
                     $"Power BI refresh status check failed. HTTP {(int)detailResponse.StatusCode}: {detailContent}"
@@ -178,6 +206,16 @@ public class PowerBiApiClient
                 );
             }
 
+            // For on-demand refreshes Power BI can return HTTP 202 with status Unknown while
+            // execution is still in progress. Treat that as a running state, not an error.
+            if (detailResponse.StatusCode == System.Net.HttpStatusCode.Accepted ||
+                string.Equals(status, "Unknown", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(status))
+            {
+                progress?.Invoke($"Semantic model refresh {refreshId} is still running. Status={status}.");
+                continue;
+            }
+
             progress?.Invoke(
                 $"Semantic model refresh {refreshId} status: {status}; extendedStatus={detail?.ExtendedStatus}."
             );
@@ -187,5 +225,161 @@ public class PowerBiApiClient
             $"Timed out waiting for semantic model refresh {refreshId} after 30 minutes."
         );
     }
+
+    private async Task<PowerBiDatasetInfo> GetDatasetInfoAsync(
+        string workspaceId,
+        string datasetId,
+        CancellationToken cancellationToken)
+    {
+        await PrepareRequestAsync();
+
+        string endpoint = $"groups/{workspaceId}/datasets/{datasetId}";
+        using HttpResponseMessage response = await _httpClient.GetAsync(endpoint, cancellationToken);
+        string content = await response.Content.ReadAsStringAsync(cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException(
+                $"Power BI dataset lookup failed. HTTP {(int)response.StatusCode}: {content}"
+            );
+        }
+
+        PowerBiDatasetInfo dataset = JsonSerializer.Deserialize<PowerBiDatasetInfo>(content, _jsonOptions);
+
+        if (dataset == null || string.IsNullOrWhiteSpace(dataset.Id))
+        {
+            throw new InvalidOperationException(
+                $"Power BI REST API returned an invalid semantic model for dataset '{datasetId}'."
+            );
+        }
+
+        return dataset;
+    }
+
+    private async Task<DatasetRefreshHistoryResponse> GetRefreshHistoryAsync(
+        string workspaceId,
+        string datasetId,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        await PrepareRequestAsync();
+
+        string endpoint = $"groups/{workspaceId}/datasets/{datasetId}/refreshes?$top={top}";
+        using HttpResponseMessage response = await _httpClient.GetAsync(endpoint, cancellationToken);
+        string content = await response.Content.ReadAsStringAsync(cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException(
+                $"Power BI refresh history lookup failed. HTTP {(int)response.StatusCode}: {content}"
+            );
+        }
+
+        DatasetRefreshHistoryResponse history = JsonSerializer.Deserialize<DatasetRefreshHistoryResponse>(
+            content,
+            _jsonOptions
+        );
+
+        return history ?? new DatasetRefreshHistoryResponse();
+    }
+
+    private static string TryGetRefreshIdFromResponse(HttpResponseMessage response)
+    {
+        if (response.Headers.Location != null)
+        {
+            string location = response.Headers.Location.ToString().TrimEnd('/');
+            int slashIndex = location.LastIndexOf('/');
+
+            if (slashIndex >= 0 && slashIndex < location.Length - 1)
+            {
+                string candidate = location[(slashIndex + 1)..];
+                if (Guid.TryParse(candidate, out _))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        if (response.Headers.TryGetValues("x-ms-request-id", out IEnumerable<string> requestIds))
+        {
+            string candidate = requestIds.FirstOrDefault(x => Guid.TryParse(x, out _));
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<string> ResolveRefreshIdFromHistoryAsync(
+        string workspaceId,
+        string datasetId,
+        HashSet<string> knownRequestIds,
+        DateTimeOffset requestStartedUtc,
+        Action<string> progress,
+        CancellationToken cancellationToken)
+    {
+        DateTimeOffset deadline = DateTimeOffset.UtcNow.AddMinutes(2);
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            DatasetRefreshHistoryResponse history = await GetRefreshHistoryAsync(
+                workspaceId,
+                datasetId,
+                10,
+                cancellationToken
+            );
+
+            DatasetRefreshHistoryEntry candidate = history.Value
+                .Where(x => !string.IsNullOrWhiteSpace(x.RequestId))
+                .Where(x => !knownRequestIds.Contains(x.RequestId))
+                .Where(x => IsRefreshStartedNearRequest(x.StartTime, requestStartedUtc))
+                .OrderByDescending(x => ParseDateTimeOffset(x.StartTime))
+                .FirstOrDefault();
+
+            if (candidate != null)
+            {
+                progress?.Invoke(
+                    $"Refresh requestId resolved from history: {candidate.RequestId}; " +
+                    $"refreshType={candidate.RefreshType}; startTime={candidate.StartTime}; status={candidate.Status}."
+                );
+
+                return candidate.RequestId;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+        }
+
+        throw new InvalidOperationException(
+            "Power BI accepted the semantic model refresh, but its requestId could not be correlated " +
+            "from Location, x-ms-request-id, or the dataset refresh history within 2 minutes."
+        );
+    }
+
+    private static bool IsRefreshStartedNearRequest(string startTime, DateTimeOffset requestStartedUtc)
+    {
+        DateTimeOffset parsed = ParseDateTimeOffset(startTime);
+        if (parsed == DateTimeOffset.MinValue)
+        {
+            return true;
+        }
+
+        // Allow a small clock/serialization tolerance while excluding unrelated older refreshes.
+        return parsed >= requestStartedUtc.AddSeconds(-30);
+    }
+
+    private static DateTimeOffset ParseDateTimeOffset(string value)
+    {
+        if (DateTimeOffset.TryParse(value, out DateTimeOffset parsed))
+        {
+            return parsed;
+        }
+
+        return DateTimeOffset.MinValue;
+    }
+
 
 }
